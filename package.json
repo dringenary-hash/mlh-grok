@@ -1,0 +1,9 @@
+{
+  "name": "mrg-data-analysis",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "generate": "python3 scripts/generate_intake.py",
+    "test": "node --test tests/desk.test.mjs"
+  }
+}
