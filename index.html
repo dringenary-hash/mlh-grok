@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MRG Data Analysis</title>
+    <meta
+      name="description"
+      content="Ask questions about an MRG intake CSV, or skip to submission and export the seven-column file."
+    />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect fill='%23241c16' width='32' height='32'/%3E%3Ctext x='16' y='21' text-anchor='middle' fill='%23f3ecdf' font-family='Georgia' font-size='11'%3EMRG%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="css/app.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="mark" aria-hidden="true">MRG</span>
+        <div>
+          <p class="kicker">Laboratories · Schneider Prize 2026</p>
+          <h1>Data Analysis</h1>
+        </div>
+      </div>
+      <p class="source" id="source-line">Loading the sample week</p>
+      <div class="actions">
+        <button type="button" id="import-btn">Import CSV</button>
+        <button type="button" id="sample-btn">Load sample week</button>
+        <button type="button" id="skip-btn" class="primary">Skip to submission</button>
+      </div>
+    </header>
+
+    <div class="banner" id="banner" role="alert" hidden></div>
+
+    <section class="stats" aria-label="Full file">
+      <article class="stat">
+        <p class="stat-value" id="stat-count">–</p>
+        <p class="stat-label">Samples in the file</p>
+      </article>
+      <article class="stat">
+        <p class="stat-value" id="stat-split">–</p>
+        <p class="stat-label">Large / small tubes</p>
+      </article>
+      <article class="stat">
+        <p class="stat-value" id="stat-machines">–</p>
+        <p class="stat-label">Machines named</p>
+      </article>
+      <article class="stat">
+        <p class="stat-value" id="stat-turnaround">–</p>
+        <p class="stat-label">Median turnaround, days</p>
+      </article>
+    </section>
+
+    <section class="chart-panel" aria-labelledby="chart-title">
+      <div class="chart-head">
+        <h2 id="chart-title">Samples by date received</h2>
+        <p>Full file. Choose a day to pull those rows into the sheet.</p>
+      </div>
+      <div class="chart" id="day-chart"></div>
+    </section>
+
+    <main class="workspace">
+      <section class="sheet" aria-labelledby="sheet-title">
+        <div class="sheet-bar">
+          <div>
+            <h2 id="sheet-title">Intake sheet</h2>
+            <p id="filter-label">All samples</p>
+          </div>
+          <label class="search">
+            <span>Search the sheet</span>
+            <input id="search" type="search" placeholder="ID, machine, lube, serial" />
+          </label>
+          <button type="button" id="clear-filter" hidden>Show every sample</button>
+        </div>
+        <p class="legend">Shaded cells are blank on the label. The exported CSV leaves them empty. Tube is read from the sample ID and is not a column.</p>
+        <div class="table-wrap">
+          <table>
+            <caption class="visually-hidden">Intake samples for the current question</caption>
+            <thead>
+              <tr>
+                <th scope="col">Tube</th>
+                <th scope="col">Sample ID</th>
+                <th scope="col">Date Sampled</th>
+                <th scope="col">Date Received</th>
+                <th scope="col">Machine</th>
+                <th scope="col">Component</th>
+                <th scope="col">Serial Number</th>
+                <th scope="col">Reference Lube</th>
+              </tr>
+            </thead>
+            <tbody id="table-body"></tbody>
+          </table>
+        </div>
+        <div class="pager">
+          <button type="button" id="page-prev">Previous</button>
+          <p id="page-label">–</p>
+          <button type="button" id="page-next">Next</button>
+        </div>
+      </section>
+
+      <section class="desk" aria-labelledby="desk-title">
+        <div class="desk-head">
+          <h2 id="desk-title">Ask about this file</h2>
+          <p>Patterns, one machine, one lube, one intake day, missing serial numbers, or turnaround.</p>
+        </div>
+        <div class="log" id="log" aria-live="polite"></div>
+        <div class="suggestions" id="suggestions"></div>
+        <form class="ask" id="ask-form">
+          <label class="visually-hidden" for="ask-input">Question</label>
+          <input id="ask-input" name="question" autocomplete="off" placeholder="Ask about the samples in this file" />
+          <button type="submit" class="primary">Ask</button>
+        </form>
+      </section>
+    </main>
+
+    <input id="file-input" type="file" accept=".csv,text/csv" hidden />
+    <div class="drop" id="drop-overlay" hidden>Drop the CSV to import it</div>
+
+    <dialog id="map-dialog">
+      <form id="map-form">
+        <h2>Match your columns</h2>
+        <p id="map-note"></p>
+        <div id="map-fields" class="map-fields"></div>
+        <div class="dialog-actions">
+          <button type="button" id="map-cancel">Cancel</button>
+          <button type="submit" class="primary">Use this file</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="submit-dialog">
+      <form id="submit-form">
+        <h2>Submission file</h2>
+        <p>Name the CSV and download it. The file stays on this computer. Nothing is uploaded.</p>
+        <p id="submit-summary"></p>
+        <label for="file-name">File name</label>
+        <input id="file-name" name="filename" autocomplete="off" spellcheck="false" />
+        <p id="submit-error" class="form-error" role="alert"></p>
+        <p class="column-note">Seven columns, in prize order. Empty label fields stay empty.</p>
+        <ul id="submit-columns" class="column-list"></ul>
+        <div class="dialog-actions">
+          <button type="button" id="submit-close">Close</button>
+          <button type="submit" class="primary" id="download-all">Download full file</button>
+        </div>
+        <button type="button" class="text-button" id="download-shown" hidden>
+          Download the rows in the table
+        </button>
+      </form>
+    </dialog>
+
+    <script type="module" src="js/app.js"></script>
+  </body>
+</html>
