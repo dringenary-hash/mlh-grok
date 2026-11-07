@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+rsa_key.p8
+*.p8
+.venv/
+venv/
