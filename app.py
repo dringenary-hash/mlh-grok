@@ -77,46 +77,6 @@ OCR_TO_SF = {
     "Component": "COMPONENT",
     "Serial Number": "SERIAL_NUMBER",
     "Reference Lube": "REFERENCE_LUBE",
-    "Tube Size": "TUBE_SIZE",
-}
-TUBE_HEADERS = ["TUBE_SIZE", "TUBE", "SIZE", "TUBE_TYPE"]
-TUBE_VALUES = {
-    "S": "SMALL", "SM": "SMALL", "SMALL": "SMALL",
-    "L": "LARGE", "LG": "LARGE", "LARGE": "LARGE",
-}
-ALL = "__ALL__"
-# Sample Intake (app2) copy
-INTAKE_TEXT = {
-    "title": "MRG Laboratories - Sample Intake",
-    "upload": "Upload weekly OCR output CSV",
-    "loaded": "Loaded {n} rows into batch {b}",
-    "batch": "Batch",
-    "samples": "Samples", "dups": "Duplicate IDs", "missing": "Missing fields",
-    "bad_dates": "Bad dates", "turnaround": "Avg turnaround (days)",
-    "tab_dash": "Dashboard", "tab_chat": "Ask the data",
-    "tab_fix": "Flagged samples", "tab_data": "Data",
-    "per_day": "Samples received per day", "per_machine": "Samples per machine",
-    "per_component": "Samples per component", "per_tube": "Small vs Large tubes",
-    "chat_hint": "Ask a question, e.g. 'Which machines have the longest turnaround?'",
-    "dup_alert": "{n} rows share a Sample ID and are flagged - see the Flagged samples tab.",
-    "no_issues": "No flagged samples - ready to submit.",
-    "save": "Save flag changes", "saved": "Flag changes saved.",
-    "unflag_col": "Unflag",
-    "unflag_hint": "Tick 'Unflag' to clear a flag (untick to re-flag), then save.",
-    "submit": "Submit to MRG",
-    "submitted": "Your data has been submitted to MRG: {n} samples ({f} flagged for review).",
-    "popup_title": "Submitted to MRG",
-    "flag_note": "{n} samples are flagged. Labels can't be corrected - they will be submitted with their flag.",
-    "nothing": "No pending samples in this batch.",
-    "feed": "Server feed", "feed_mode": "Mode", "feed_source": "Source",
-    "feed_last": "Last pull", "feed_new": "Rows imported (last pull)",
-    "feed_total": "Server rows read so far",
-    "feed_pull": "Pull from server now", "feed_sim": "Simulate new server rows",
-    "feed_sim_n": "Rows to add", "feed_never": "Never",
-    "feed_err": "Last pull failed: {e}",
-    "feed_history": "Recent pulls",
-    "all_batches": "All batches", "unknown": "Unknown",
-    "submit_pick": "Pick a single batch to submit.",
 }
 
 # Inject MRG Labs CSS Theme, Bento Box Layout, and Spinning Loading Circle
@@ -315,10 +275,6 @@ if 'msgs' not in st.session_state:
     st.session_state.msgs = []
 if 'ai_grease_analysis' not in st.session_state:
     st.session_state.ai_grease_analysis = None
-if 'sf_msgs' not in st.session_state:
-    st.session_state.sf_msgs = []
-if 'chat_batch' not in st.session_state:
-    st.session_state.chat_batch = None
 if 'grok_qc_report' not in st.session_state:
     st.session_state.grok_qc_report = None
 if 'grok_qc_error' not in st.session_state:
@@ -1314,24 +1270,14 @@ def get_snowflake_session():
     return snowpark.Session.builder.configs(conn_params).create()
 
 
-def normalize_tube_series(tube):
-    """Map tube size aliases; keep unrecognized values so they flag as missing tube size."""
-    if tube is None:
-        return None
-    cleaned = tube.astype(str).str.strip()
-    cleaned = cleaned.mask(cleaned.str.lower().isin(["", "none", "nan", "nat", "<na>"]))
-    return cleaned.str.upper().map(lambda v: TUBE_VALUES.get(v, v) if isinstance(v, str) else v)
-
-
 def ocr_df_to_snowflake_frame(df: pd.DataFrame) -> pd.DataFrame:
     """Map Gemini OCR columns to the Snowflake intake staging schema."""
     sf_df = df.rename(columns=OCR_TO_SF).copy()
     for col in CSV_COLS:
         if col not in sf_df.columns:
             sf_df[col] = None
-    upper_map = {str(c).strip().upper().replace(" ", "_"): c for c in sf_df.columns}
-    tube_col = next((upper_map[h] for h in TUBE_HEADERS if h in upper_map), None)
-    sf_df["TUBE_SIZE"] = normalize_tube_series(sf_df[tube_col]) if tube_col else None
+    if "TUBE_SIZE" not in sf_df.columns:
+        sf_df["TUBE_SIZE"] = None
     for col in CSV_COLS + ["TUBE_SIZE"]:
         sf_df[col] = sf_df[col].astype(str).where(sf_df[col].notna(), None)
         sf_df[col] = sf_df[col].replace({"None": None, "nan": None, "NaT": None})
@@ -1361,48 +1307,12 @@ def push_ocr_batch_to_snowflake(df: pd.DataFrame) -> str:
         session.close()
 
 
-def sf_query(session, sql: str, params=None) -> pd.DataFrame:
-    return session.sql(sql, params=params).to_pandas()
-
-
-def ask_analyst(session, messages):
-    """Cortex Analyst over the MRG intake semantic view (Sample Intake / app2)."""
-    payload = {"messages": messages, "semantic_view": SEMANTIC_VIEW}
-    if _snowflake is not None:
-        resp = _snowflake.send_snow_api_request(
-            "POST", "/api/v2/cortex/analyst/message", {}, {}, payload, None, 50000
-        )
-        status, body = resp["status"], json.loads(resp["content"])
-    else:
-        token_path = "/snowflake/session/token"
-        if os.path.exists(token_path):
-            token = open(token_path).read().strip()
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "X-Snowflake-Authorization-Token-Type": "OAUTH",
-            }
-            host = os.environ.get("SNOWFLAKE_HOST") or session.connection.host
-        else:
-            headers = {"Authorization": f'Snowflake Token="{session.connection.rest.token}"'}
-            host = session.connection.host
-        r = requests.post(
-            f"https://{host}/api/v2/cortex/analyst/message",
-            json=payload,
-            headers=headers,
-            timeout=60,
-        )
-        status, body = r.status_code, r.json()
-    if status >= 400:
-        raise RuntimeError(body.get("message", body))
-    return body["message"]
-
-
 def build_batch_qc_stats(df: pd.DataFrame) -> dict:
     """Lightweight batch stats sent to Grok for automated QC (no raw images)."""
     work = df.copy()
     for col in [
-        "Sample ID", "Date Sampled", "Date Received",
-        "Machine", "Component", "Serial Number", "Reference Lube", "Tube Size",
+        "Sample ID", "Tube Size", "Date Sampled", "Date Received",
+        "Machine", "Component", "Serial Number", "Reference Lube",
     ]:
         if col not in work.columns:
             work[col] = None
@@ -1413,7 +1323,7 @@ def build_batch_qc_stats(df: pd.DataFrame) -> dict:
     dup_ids = sample_ids[sample_ids.duplicated(keep=False) & ~sample_ids.isin(["", "nan", "ERROR", "None"])]
     missing_fields = {
         col: int(work[col].isna().sum() + (work[col].astype(str).str.strip() == "").sum())
-        for col in ["Date Sampled", "Machine", "Component", "Serial Number", "Reference Lube", "Tube Size"]
+        for col in ["Tube Size", "Date Sampled", "Machine", "Component", "Serial Number", "Reference Lube"]
     }
     preview_cols = [c for c in [
         "Sample ID", "Tube Size", "Date Sampled", "Date Received", "Machine",
@@ -1602,9 +1512,7 @@ def process_label(client, uploaded_file):
         }
 
 
-tab1, tab2, tab3, tab4 = st.tabs([
-    "Image Upload", "Data Viewer", "Grease Intelligence", "Snowflake Intake",
-])
+tab1, tab2, tab3 = st.tabs(["Image Upload", "Data Viewer", "Snowflake Intake"])
 
 with tab1:
     col_text, col_btn = st.columns([3, 1])
@@ -1983,10 +1891,9 @@ with tab2:
     except Exception as e:
         st.error(f"Could not connect to database: {e}")
 
-# ---------- Grease intelligence (local CSV / OCR analysis) ----------
+# ---------- Snowflake Sample Intake (Dashboard + Reasoning AI) ----------
 with tab3:
     st.subheader("MRG Laboratories — Grease Sample Intake & Intelligence")
-    st.caption("Live Snowflake batches, Cortex Analyst, and Submit to MRG are on the **Snowflake Intake** tab.")
 
     # CSV File Upload Field (Analysis is performed on this uploaded CSV)
     col_csv, col_tab1_ref = st.columns([3, 1])
@@ -2354,321 +2261,3 @@ with tab3:
                         edit_state["version"] += 1
                         st.session_state["tab3_msg"] = (level, message)
                         st.rerun()
-# ---------- Snowflake Intake (app2: feed, Cortex Analyst, flags, submit) ----------
-with tab4:
-    T = INTAKE_TEXT
-    st.subheader(T["title"])
-    st.caption(
-        "Live Snowflake review of batches synced from OCR → Tiger Data → STAGING_SAMPLES. "
-        "Ask Cortex Analyst about copied rows, missing fields, duplicates, and turnaround."
-    )
-    try:
-        session = get_snowflake_session()
-    except Exception as e:
-        st.error(f"Could not connect to Snowflake: {e}")
-        st.info(
-            "Set SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, and place rsa_key.p8 in the app directory "
-            "(or set SNOWFLAKE_PRIVATE_KEY_PATH)."
-        )
-        session = None
-
-    if session is not None:
-        def q(sql: str, params=None) -> pd.DataFrame:
-            return sf_query(session, sql, params=params)
-
-        try:
-            with st.expander(T["feed"], expanded=True):
-                try:
-                    cfg = q(f"SELECT MODE, SOURCE_URL, SIM_FILE FROM {DB_SCHEMA}.FEED_CONFIG").iloc[0]
-                    runs = q(f"SELECT * FROM {DB_SCHEMA}.FEED_RUN_LOG ORDER BY RUN_AT DESC LIMIT 10")
-                    state = q(f"SELECT LAST_ROW_NUMBER FROM {DB_SCHEMA}.FEED_STATE")
-                    src = (
-                        cfg["SOURCE_URL"] if cfg["MODE"] == "LIVE"
-                        else f"@SIM_SERVER/{cfg['SIM_FILE']} (stand-in for {cfg['SOURCE_URL']})"
-                    )
-                    k = st.columns(4)
-                    k[0].metric(T["feed_mode"], cfg["MODE"])
-                    k[1].metric(
-                        T["feed_last"],
-                        f"{runs.iloc[0]['RUN_AT']:%b %d %H:%M}" if len(runs) else T["feed_never"],
-                    )
-                    k[2].metric(T["feed_new"], int(runs.iloc[0]["ROWS_NEW"]) if len(runs) else 0)
-                    k[3].metric(T["feed_total"], int(state.iloc[0, 0]) if len(state) else 0)
-                    st.caption(f"{T['feed_source']}: {src}")
-                    if len(runs) and pd.notna(runs.iloc[0]["ERROR"]):
-                        st.error(T["feed_err"].format(e=runs.iloc[0]["ERROR"]))
-                    b1, b2, b3 = st.columns([2, 2, 1])
-                    if b1.button(T["feed_pull"], type="primary", use_container_width=True):
-                        with st.spinner(T["feed_pull"]):
-                            msg = session.sql(f"CALL {DB_SCHEMA}.PULL_FEED()").collect()[0][0]
-                        st.session_state.feed_msg = msg
-                        st.rerun()
-                    if cfg["MODE"] == "SIMULATED":
-                        n_add = b3.number_input(T["feed_sim_n"], 1, 500, 50, label_visibility="collapsed")
-                        if b2.button(T["feed_sim"], use_container_width=True):
-                            st.toast(
-                                session.sql(
-                                    f"CALL {DB_SCHEMA}.SIMULATE_SERVER_APPEND({int(n_add)})"
-                                ).collect()[0][0]
-                            )
-                    if "feed_msg" in st.session_state:
-                        m = st.session_state.pop("feed_msg")
-                        (st.error if str(m).startswith("ERROR") else st.success)(m)
-                    if len(runs):
-                        st.caption(T["feed_history"])
-                        st.dataframe(
-                            runs[["RUN_AT", "ROWS_READ", "ROWS_NEW", "METHOD", "BATCH_ID", "ERROR"]],
-                            hide_index=True, use_container_width=True,
-                        )
-                except Exception as feed_err:
-                    st.warning(f"Server feed unavailable: {feed_err}")
-
-            with st.expander(T["upload"]):
-                f = st.file_uploader("CSV", type="csv", label_visibility="collapsed", key="sf_live_csv")
-                if f is not None and st.button("Load", key="sf_live_load"):
-                    up_df = pd.read_csv(f, dtype=str)
-                    up_df.columns = [c.strip().upper().replace(" ", "_") for c in up_df.columns]
-                    tube_col = next((h for h in TUBE_HEADERS if h in up_df.columns), None)
-                    tube = up_df[tube_col] if tube_col else None
-                    up_df = up_df.reindex(columns=CSV_COLS)
-                    up_df["TUBE_SIZE"] = normalize_tube_series(tube)
-                    batch_id = f"BATCH_{pd.Timestamp.now():%Y%m%d_%H%M%S}"
-                    up_df["BATCH_ID"] = batch_id
-                    session.write_pandas(
-                        up_df, "STAGING_SAMPLES",
-                        database=SF_DATABASE, schema=SF_SCHEMA,
-                        auto_create_table=False, overwrite=False,
-                    )
-                    session.sql(
-                        f"UPDATE {DB_SCHEMA}.STAGING_SAMPLES SET STATUS = 'PENDING' WHERE STATUS IS NULL"
-                    ).collect()
-                    st.session_state.last_snowflake_batch = batch_id
-                    st.success(T["loaded"].format(n=len(up_df), b=batch_id))
-
-            batches = q(
-                f"SELECT DISTINCT BATCH_ID FROM {DB_SCHEMA}.STAGING_SAMPLES ORDER BY 1 DESC"
-            )["BATCH_ID"].tolist()
-            if not batches:
-                st.info("No samples in Snowflake yet. Process labels on Image Upload first.")
-            else:
-                default_idx = 0
-                if st.session_state.last_snowflake_batch in batches:
-                    default_idx = batches.index(st.session_state.last_snowflake_batch)
-                batch = st.selectbox(
-                    T["batch"], batches + [ALL], index=default_idx,
-                    format_func=lambda b: T["all_batches"] if b == ALL else b,
-                )
-                if st.session_state.get("chat_batch") != batch:
-                    try:
-                        session.sql(
-                            f"""MERGE INTO {DB_SCHEMA}.CHAT_BATCH_SELECTION t
-                                USING (SELECT CURRENT_USER() AS U) s ON t.USER_NAME = s.U
-                                WHEN MATCHED THEN UPDATE SET BATCH_ID = ?, UPDATED_AT = CURRENT_TIMESTAMP()
-                                WHEN NOT MATCHED THEN INSERT VALUES (s.U, ?, CURRENT_TIMESTAMP())""",
-                            params=[batch, batch],
-                        ).collect()
-                    except Exception as sel_err:
-                        st.caption(f"Chat batch selection note: {sel_err}")
-                    st.session_state.chat_batch = batch
-
-                data = (
-                    q(f"SELECT * FROM {DB_SCHEMA}.MRG_VIEW") if batch == ALL
-                    else q(f"SELECT * FROM {DB_SCHEMA}.MRG_VIEW WHERE BATCH_ID = ?", [batch])
-                )
-                pending = data[data["STATUS"] == "PENDING"] if "STATUS" in data.columns else data
-                dup_rows = (
-                    pending[pending["IS_DUPLICATE"]] if "IS_DUPLICATE" in pending.columns
-                    else pending.iloc[0:0]
-                )
-
-                c = st.columns(5)
-                c[0].metric(T["samples"], len(data))
-                c[1].metric(T["dups"], int(data["IS_DUPLICATE"].sum()) if "IS_DUPLICATE" in data else 0)
-                c[2].metric(T["missing"], int(data["HAS_MISSING_FIELD"].sum()) if "HAS_MISSING_FIELD" in data else 0)
-                c[3].metric(T["bad_dates"], int(data["HAS_BAD_DATE"].sum()) if "HAS_BAD_DATE" in data else 0)
-                turnaround = (
-                    round(float(data["TURNAROUND_DAYS"].mean() or 0), 1)
-                    if "TURNAROUND_DAYS" in data and len(data) else 0
-                )
-                c[4].metric(T["turnaround"], turnaround)
-                if len(dup_rows):
-                    st.warning(T["dup_alert"].format(n=len(dup_rows)))
-
-                tab_dash, tab_chat, tab_fix, tab_data = st.tabs(
-                    [T["tab_dash"], T["tab_chat"], T["tab_fix"], T["tab_data"]]
-                )
-
-                with tab_dash:
-                    a, b = st.columns(2)
-                    if "DATE_RECEIVED" in data.columns:
-                        a.subheader(T["per_day"])
-                        a.bar_chart(data.groupby("DATE_RECEIVED").size().rename("samples"))
-                    machine_col = "NORM_MACHINE" if "NORM_MACHINE" in data.columns else "MACHINE"
-                    if machine_col in data.columns:
-                        b.subheader(T["per_machine"])
-                        b.bar_chart(data.groupby(machine_col).size().rename("samples"))
-                    if "COMPONENT" in data.columns:
-                        a.subheader(T["per_component"])
-                        a.bar_chart(data.groupby("COMPONENT").size().rename("samples"))
-                    if "TUBE_SIZE" in data.columns:
-                        b.subheader(T["per_tube"])
-                        b.bar_chart(data["TUBE_SIZE"].fillna(T["unknown"]).value_counts().rename("samples"))
-
-                def batch_context() -> str:
-                    if batch == ALL:
-                        return f"Context: the user is viewing ALL batches ({len(data)} samples in total)."
-                    return (
-                        f"Context: the user is viewing batch {batch} ({len(data)} samples). "
-                        "The data is already limited to this batch; count only these samples."
-                    )
-
-                with tab_chat:
-                    st.caption(batch_context().replace("Context: the user is", "Answering about"))
-                    for m in st.session_state.sf_msgs:
-                        with st.chat_message(m["role"]):
-                            if m.get("batch_label"):
-                                st.caption(m["batch_label"])
-                            for part in m["content"]:
-                                if part["type"] == "text":
-                                    st.markdown(part["text"])
-                                elif part["type"] == "sql":
-                                    with st.expander("SQL"):
-                                        st.code(part["statement"], language="sql")
-                                    res = part.get("result")
-                                    if res is None:
-                                        continue
-                                    st.dataframe(res, use_container_width=True)
-                                    num = res.select_dtypes("number").columns
-                                    if len(res.columns) == 2 and len(num) == 1 and len(res) > 1:
-                                        st.bar_chart(res.set_index(res.columns[0]))
-                    prompt = st.chat_input(T["chat_hint"])
-                    if prompt:
-                        st.session_state.sf_msgs.append(
-                            {"role": "user", "content": [{"type": "text", "text": prompt}]}
-                        )
-                        api_msgs = [
-                            {
-                                "role": m["role"],
-                                "content": [{k: v for k, v in p.items() if k != "result"} for p in m["content"]],
-                            }
-                            for m in st.session_state.sf_msgs
-                        ]
-                        api_msgs[-1]["content"] = [
-                            {"type": "text", "text": f"{batch_context()}\n\nQuestion: {prompt}"}
-                        ]
-                        try:
-                            reply = ask_analyst(session, api_msgs)
-                            for part in reply["content"]:
-                                if part["type"] == "sql":
-                                    part["result"] = q(part["statement"])
-                            label = T["all_batches"] if batch == ALL else batch
-                            st.session_state.sf_msgs.append(
-                                {"role": "analyst", "content": reply["content"], "batch_label": label}
-                            )
-                        except Exception as e:
-                            st.session_state.sf_msgs.pop()
-                            st.error(str(e))
-                        st.rerun()
-
-                if "HAS_ANY_ISSUE" in pending.columns:
-                    flagged = pending[pending["HAS_ANY_ISSUE"]].copy()
-                elif {"IS_DUPLICATE", "HAS_MISSING_FIELD", "HAS_BAD_DATE"}.issubset(pending.columns):
-                    flagged = pending[
-                        pending["IS_DUPLICATE"] | pending["HAS_MISSING_FIELD"] | pending["HAS_BAD_DATE"]
-                    ].copy()
-                else:
-                    flagged = pending.iloc[0:0]
-
-                with tab_fix:
-                    if len(flagged) and "UNFLAGGED" in flagged.columns:
-                        st.warning(T["flag_note"].format(n=int((~flagged["UNFLAGGED"]).sum())))
-                        st.caption(T["unflag_hint"])
-                        show_cols = [c for c in (
-                            ["UNFLAGGED", "FLAG_REASON", "ROW_ID", "BATCH_ID"] + CSV_COLS + ["TUBE_SIZE"]
-                        ) if c in flagged.columns]
-                        edited = st.data_editor(
-                            flagged[show_cols],
-                            key="unflag_editor", hide_index=True, use_container_width=True,
-                            column_config={
-                                "UNFLAGGED": st.column_config.CheckboxColumn(T["unflag_col"]),
-                                "ROW_ID": None,
-                            },
-                            disabled=[c for c in show_cols if c != "UNFLAGGED"],
-                        )
-                        changed = edited[edited["UNFLAGGED"] != flagged["UNFLAGGED"].values]
-                        if st.button(T["save"], disabled=changed.empty):
-                            for row_id, val in zip(changed["ROW_ID"], changed["UNFLAGGED"]):
-                                session.sql(
-                                    f"UPDATE {DB_SCHEMA}.STAGING_SAMPLES SET UNFLAGGED = ? WHERE ROW_ID = ?",
-                                    params=[bool(val), int(row_id)],
-                                ).collect()
-                            st.toast(T["saved"])
-                            st.rerun()
-                    elif len(flagged):
-                        st.dataframe(flagged, use_container_width=True, hide_index=True)
-                    else:
-                        st.success(T["no_issues"])
-
-                with tab_data:
-                    st.dataframe(data, use_container_width=True, hide_index=True)
-
-                st.divider()
-                nothing = len(pending) == 0
-                flagged_count = (
-                    int(pending["IS_FLAGGED"].sum())
-                    if "IS_FLAGGED" in pending.columns and len(pending) else 0
-                )
-
-                def submit(action: str):
-                    user = session.sql("SELECT CURRENT_USER()").collect()[0][0]
-                    n = len(pending)
-                    session.sql(
-                        f"""
-                        INSERT INTO {DB_SCHEMA}.MRG_SAMPLES
-                        SELECT SAMPLE_ID, DATE_SAMPLED, DATE_RECEIVED, MACHINE, COMPONENT,
-                               SERIAL_NUMBER, REFERENCE_LUBE, TUBE_SIZE, BATCH_ID,
-                               CURRENT_TIMESTAMP(), ?,
-                               IS_FLAGGED,
-                               NULLIF(TRIM(COALESCE(FLAG_REASON, '') ||
-                                   IFF(UNFLAGGED AND HAS_ANY_ISSUE, ' (unflagged by user)', '')), '')
-                        FROM {DB_SCHEMA}.MRG_VIEW
-                        WHERE BATCH_ID = ? AND STATUS = 'PENDING'
-                        """,
-                        params=[user, batch],
-                    ).collect()
-                    session.sql(
-                        f"UPDATE {DB_SCHEMA}.STAGING_SAMPLES SET STATUS = 'SUBMITTED' "
-                        f"WHERE BATCH_ID = ? AND STATUS = 'PENDING'",
-                        params=[batch],
-                    ).collect()
-                    session.sql(
-                        f"INSERT INTO {DB_SCHEMA}.SUBMISSION_LOG VALUES (?, CURRENT_TIMESTAMP(), ?, ?, ?)",
-                        params=[batch, user, n, action],
-                    ).collect()
-                    st.session_state.popup = T["submitted"].format(n=n, f=int(flagged_count))
-
-                @st.dialog(T["popup_title"])
-                def submitted_popup(msg: str):
-                    st.success(msg)
-                    if st.button("OK", key="sf_submit_ok"):
-                        st.rerun()
-
-                if st.button(
-                    T["submit"], type="primary",
-                    disabled=nothing or batch == ALL, use_container_width=True,
-                ):
-                    submit("SUBMIT")
-                    st.rerun()
-                if batch == ALL:
-                    st.caption(T["submit_pick"])
-                elif nothing:
-                    st.caption(T["nothing"])
-                if "popup" in st.session_state:
-                    submitted_popup(st.session_state.pop("popup"))
-        except Exception as e:
-            st.error(f"Snowflake Intake error: {e}")
-        finally:
-            try:
-                session.close()
-            except Exception:
-                pass
