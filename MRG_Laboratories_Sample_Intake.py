@@ -43,8 +43,6 @@ TEXT = {
         "feed_pull": "Pull from server now", "feed_sim": "Simulate new server rows",
         "feed_sim_n": "Rows to add", "feed_never": "Never", "feed_err": "Last pull failed: {e}",
         "feed_history": "Recent pulls",
-        "all_batches": "All batches", "unknown": "Unknown",
-        "submit_pick": "Pick a single batch to submit.",
     }
 }
 LANG = "en"
@@ -55,9 +53,6 @@ session = st.connection("snowflake").session()
 
 CSV_COLS = ["SAMPLE_ID", "DATE_SAMPLED", "DATE_RECEIVED", "MACHINE", "COMPONENT",
             "SERIAL_NUMBER", "REFERENCE_LUBE"]
-TUBE_HEADERS = ["TUBE_SIZE", "TUBE", "SIZE", "TUBE_TYPE"]
-TUBE_VALUES = {"S": "SMALL", "SM": "SMALL", "SMALL": "SMALL", "L": "LARGE", "LG": "LARGE", "LARGE": "LARGE"}
-ALL = "__ALL__"
 
 
 def q(sql: str, params=None) -> pd.DataFrame:
@@ -104,12 +99,9 @@ with st.expander(T["upload"]):
     if f is not None and st.button("Load"):
         df = pd.read_csv(f, dtype=str)
         df.columns = [c.strip().upper().replace(" ", "_") for c in df.columns]
-        tube_col = next((h for h in TUBE_HEADERS if h in df.columns), None)
-        tube = df[tube_col] if tube_col else None
-        df = df.reindex(columns=CSV_COLS)
-        # Unrecognized values are kept as-is so they show up under the "Missing tube size" flag.
-        df["TUBE_SIZE"] = (tube.str.strip().str.upper().map(lambda v: TUBE_VALUES.get(v, v))
-                           if tube is not None else None)
+        df = df.reindex(columns=CSV_COLS + (["TUBE_SIZE"] if "TUBE_SIZE" in df.columns else []))
+        if "TUBE_SIZE" not in df.columns:
+            df["TUBE_SIZE"] = None
         batch = f"BATCH_{pd.Timestamp.now():%Y%m%d_%H%M%S}"
         df["BATCH_ID"] = batch
         session.write_pandas(df, "STAGING_SAMPLES", database="MRG_LABS_DB", schema="INTAKE",
@@ -121,17 +113,9 @@ batches = q(f"SELECT DISTINCT BATCH_ID FROM {DB_SCHEMA}.STAGING_SAMPLES ORDER BY
 if not batches:
     st.info(T["nothing"])
     st.stop()
-batch = st.selectbox(T["batch"], batches + [ALL], format_func=lambda b: T["all_batches"] if b == ALL else b)
+batch = st.selectbox(T["batch"], batches)
 
-# Tell the chatbot's view which batch this user is looking at (MRG_CURRENT_BATCH_VIEW filters on it).
-if st.session_state.get("chat_batch") != batch:
-    session.sql(f"""MERGE INTO {DB_SCHEMA}.CHAT_BATCH_SELECTION t USING (SELECT CURRENT_USER() AS U) s ON t.USER_NAME = s.U
-        WHEN MATCHED THEN UPDATE SET BATCH_ID = ?, UPDATED_AT = CURRENT_TIMESTAMP()
-        WHEN NOT MATCHED THEN INSERT VALUES (s.U, ?, CURRENT_TIMESTAMP())""", params=[batch, batch]).collect()
-    st.session_state.chat_batch = batch
-
-data = (q(f"SELECT * FROM {DB_SCHEMA}.MRG_VIEW") if batch == ALL
-        else q(f"SELECT * FROM {DB_SCHEMA}.MRG_VIEW WHERE BATCH_ID = ?", [batch]))
+data = q(f"SELECT * FROM {DB_SCHEMA}.MRG_VIEW WHERE BATCH_ID = ?", [batch])
 pending = data[data["STATUS"] == "PENDING"]
 dup_rows = pending[pending["IS_DUPLICATE"]]
 
@@ -154,11 +138,11 @@ with tab_dash:
     a.subheader(T["per_day"])
     a.bar_chart(data.groupby("DATE_RECEIVED").size().rename("samples"))
     b.subheader(T["per_machine"])
-    b.bar_chart(data.groupby("NORM_MACHINE").size().rename("samples"))
+    b.bar_chart(data.groupby("MACHINE").size().rename("samples"))
     a.subheader(T["per_component"])
     a.bar_chart(data.groupby("COMPONENT").size().rename("samples"))
     b.subheader(T["per_tube"])
-    b.bar_chart(data["TUBE_SIZE"].fillna(T["unknown"]).value_counts().rename("samples"))
+    b.bar_chart(data.groupby("TUBE_SIZE").size().rename("samples"))
 
 # ---------- Chatbot (Cortex Analyst over semantic view) ----------
 def ask_analyst(messages):
@@ -186,31 +170,18 @@ def ask_analyst(messages):
     return body["message"]
 
 
-def batch_context() -> str:
-    """Context line sent with each question so answers are about the batch on screen."""
-    if batch == ALL:
-        return f"Context: the user is viewing ALL batches ({len(data)} samples in total)."
-    return (f"Context: the user is viewing batch {batch} ({len(data)} samples). "
-            "The data is already limited to this batch; count only these samples.")
-
-
 with tab_chat:
     if "msgs" not in st.session_state:
         st.session_state.msgs = []
-    st.caption(batch_context().replace("Context: the user is", "Answering about"))
     for m in st.session_state.msgs:
         with st.chat_message(m["role"]):
-            if m.get("batch_label"):
-                st.caption(m["batch_label"])
             for part in m["content"]:
                 if part["type"] == "text":
                     st.markdown(part["text"])
                 elif part["type"] == "sql":
                     with st.expander("SQL"):
                         st.code(part["statement"], language="sql")
-                    res = part.get("result")
-                    if res is None:
-                        continue
+                    res = q(part["statement"])
                     st.dataframe(res, use_container_width=True)
                     num = res.select_dtypes("number").columns
                     if len(res.columns) == 2 and len(num) == 1 and len(res) > 1:
@@ -218,35 +189,29 @@ with tab_chat:
     prompt = st.chat_input(T["chat_hint"])
     if prompt:
         st.session_state.msgs.append({"role": "user", "content": [{"type": "text", "text": prompt}]})
-        # Analyst only accepts text parts; add the batch context to the latest question only.
-        api_msgs = [{"role": m["role"], "content": [{k: v for k, v in p.items() if k != "result"} for p in m["content"]]}
-                    for m in st.session_state.msgs]
-        api_msgs[-1]["content"] = [{"type": "text", "text": f"{batch_context()}\n\nQuestion: {prompt}"}]
         try:
-            reply = ask_analyst(api_msgs)
-            for part in reply["content"]:
-                if part["type"] == "sql":
-                    # Run now, while MRG_CURRENT_BATCH_VIEW is scoped to the batch this question was about.
-                    part["result"] = q(part["statement"])
-            label = T["all_batches"] if batch == ALL else batch
-            st.session_state.msgs.append({"role": "analyst", "content": reply["content"], "batch_label": label})
+            reply = ask_analyst(st.session_state.msgs)
+            st.session_state.msgs.append({"role": "analyst", "content": reply["content"]})
         except Exception as e:  # keep chat usable on API errors
             st.session_state.msgs.pop()
             st.error(str(e))
         st.rerun()
 
 # ---------- Review flagged samples (labels can't be corrected, only flagged) ----------
-flagged = pending[pending["HAS_ANY_ISSUE"]].copy()
+flagged = pending[pending["IS_DUPLICATE"] | pending["HAS_MISSING_FIELD"] | pending["HAS_BAD_DATE"]].copy()
+flagged["FLAG_REASON"] = [
+    ", ".join(n for n, f in [("Duplicate ID", d), ("Missing field", m), ("Bad date", b)] if f)
+    for d, m, b in zip(flagged["IS_DUPLICATE"], flagged["HAS_MISSING_FIELD"], flagged["HAS_BAD_DATE"])]
 with tab_fix:
     if len(flagged):
         st.warning(T["flag_note"].format(n=int((~flagged["UNFLAGGED"]).sum())))
         st.caption(T["unflag_hint"])
         edited = st.data_editor(
-            flagged[["UNFLAGGED", "FLAG_REASON", "ROW_ID", "BATCH_ID"] + CSV_COLS + ["TUBE_SIZE"]],
+            flagged[["UNFLAGGED", "FLAG_REASON", "ROW_ID"] + CSV_COLS + ["TUBE_SIZE"]],
             key="unflag_editor", hide_index=True, use_container_width=True,
             column_config={"UNFLAGGED": st.column_config.CheckboxColumn(T["unflag_col"]),
                            "ROW_ID": None},
-            disabled=["FLAG_REASON", "BATCH_ID"] + CSV_COLS + ["TUBE_SIZE"])
+            disabled=["FLAG_REASON"] + CSV_COLS + ["TUBE_SIZE"])
         changed = edited[edited["UNFLAGGED"] != flagged["UNFLAGGED"].values]
         if st.button(T["save"], disabled=changed.empty):
             for row_id, val in zip(changed["ROW_ID"], changed["UNFLAGGED"]):
@@ -267,7 +232,11 @@ def submit(action: str):
         SELECT SAMPLE_ID, DATE_SAMPLED, DATE_RECEIVED, MACHINE, COMPONENT, SERIAL_NUMBER, REFERENCE_LUBE,
                TUBE_SIZE, BATCH_ID, CURRENT_TIMESTAMP(), ?,
                IS_FLAGGED,
-               NULLIF(TRIM(COALESCE(FLAG_REASON, '') || IFF(UNFLAGGED AND HAS_ANY_ISSUE, ' (unflagged by user)', '')), '')
+               NULLIF(ARRAY_TO_STRING(ARRAY_CONSTRUCT_COMPACT(
+                   IFF(IS_DUPLICATE, 'Duplicate ID', NULL),
+                   IFF(HAS_MISSING_FIELD, 'Missing field', NULL),
+                   IFF(HAS_BAD_DATE, 'Bad date', NULL),
+                   IFF(UNFLAGGED AND (IS_DUPLICATE OR HAS_MISSING_FIELD OR HAS_BAD_DATE), '(unflagged by user)', NULL)), ', '), '')
         FROM {DB_SCHEMA}.MRG_VIEW WHERE BATCH_ID = ? AND STATUS = 'PENDING'
     """, params=[user, batch]).collect()
     session.sql(f"UPDATE {DB_SCHEMA}.STAGING_SAMPLES SET STATUS = 'SUBMITTED' WHERE BATCH_ID = ? AND STATUS = 'PENDING'",
@@ -287,11 +256,9 @@ def submitted_popup(msg: str):
 st.divider()
 nothing = len(pending) == 0
 flagged_count = pending["IS_FLAGGED"].sum()
-if st.button(T["submit"], type="primary", disabled=nothing or batch == ALL, use_container_width=True):
+if st.button(T["submit"], type="primary", disabled=nothing, use_container_width=True):
     submit("SUBMIT"); st.rerun()
-if batch == ALL:
-    st.caption(T["submit_pick"])
-elif nothing:
+if nothing:
     st.caption(T["nothing"])
 if "popup" in st.session_state:
     submitted_popup(st.session_state.pop("popup"))

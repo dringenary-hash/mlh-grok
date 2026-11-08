@@ -1,29 +1,33 @@
 # MRG Labs — Sample Label Scanner (YCP Hacks)
 
-Merged Streamlit app for Schneider / Tiger Data / Snowflake:
+Streamlit app for the Schneider Prize for Technology Innovation flow:
 
 1. **OCR** label images with Gemini  
-2. **Write** rows to **Tiger Data**  
-3. **Sync** the same batch to Snowflake `MRG_LABS_DB.INTAKE.STAGING_SAMPLES`  
-4. **Review + chat** on the **Snowflake Intake** tab (updated Sample Intake / Cortex Analyst)
+2. **Write CSV/rows to Tiger Data**  
+3. **Sync the same batch to Snowflake** (`MRG_LABS_DB.INTAKE.STAGING_SAMPLES`)  
+4. **Review + chat** with Snowflake Cortex Analyst on the **Snowflake Intake** tab  
 
 ## Tabs
 
-- **Image Upload** — Gemini OCR, Tiger Data write, Snowflake sync, CSV download, minesweeper  
+- **Image Upload** — Gemini OCR, Tiger Data write, Snowflake sync, CSV download  
 - **Data Viewer** — live Tiger Data table + optional re-sync to Snowflake  
-- **Snowflake Intake** — server feed, all-batches view, dashboard, Cortex Analyst chat, flags, submit to MRG  
+- **Snowflake Intake** — Sample Intake dashboard, flagged samples, Cortex Analyst chatbot, submit to MRG  
 
-`MRG_Laboratories_Sample_Intake.py` is the standalone Sample Intake reference (app2).
-
-## Env
+## Required environment
 
 | Variable | Purpose |
 |---|---|
 | `GEMINI_API_KEY` | Gemini OCR |
 | `TIGERDATA_URI` | Tiger Data (Postgres) SQLAlchemy URI |
-| `SNOWFLAKE_ACCOUNT` / `SNOWFLAKE_USER` | Snowflake key-pair login |
-| `rsa_key.p8` | Private key (or `SNOWFLAKE_PRIVATE_KEY_PATH`) |
-| `SNOWFLAKE_DATABASE` / `SCHEMA` / `WAREHOUSE` / `ROLE` | optional overrides |
+| `SNOWFLAKE_ACCOUNT` | Snowflake account |
+| `SNOWFLAKE_USER` | Snowflake user |
+| `SNOWFLAKE_PRIVATE_KEY_PATH` | Path to `rsa_key.p8` (default: `rsa_key.p8`) |
+| `SNOWFLAKE_DATABASE` | Default `MRG_LABS_DB` |
+| `SNOWFLAKE_SCHEMA` | Default `INTAKE` |
+| `SNOWFLAKE_WAREHOUSE` | Default `COMPUTE_WH` |
+| `SNOWFLAKE_ROLE` | Default `ACCOUNTADMIN` |
+
+Snowflake objects expected (from the Sample Intake demo): `STAGING_SAMPLES`, `MRG_VIEW`, `MRG_SAMPLES`, `SUBMISSION_LOG`, semantic view `MRG_INTAKE_SV`.
 
 ## Run
 
