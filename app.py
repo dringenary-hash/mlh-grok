@@ -132,8 +132,15 @@ if 'last_snowflake_batch' not in st.session_state:
     st.session_state.last_snowflake_batch = None
 if 'msgs' not in st.session_state:
     st.session_state.msgs = []
+if 'grok_qc_report' not in st.session_state:
+    st.session_state.grok_qc_report = None
+if 'grok_qc_error' not in st.session_state:
+    st.session_state.grok_qc_error = None
 
 api_key = os.environ.get("GEMINI_API_KEY")
+XAI_API_KEY = os.environ.get("XAI_API_KEY") or os.environ.get("GROK_API_KEY")
+GROK_MODEL = os.environ.get("GROK_MODEL", "grok-3-mini")
+GROK_QC_LOG = os.environ.get("GROK_QC_LOG", "grok_qc_log.md")
 
 if not api_key:
     st.error("Server Configuration Error: GEMINI_API_KEY environment variable is not set.")
@@ -216,6 +223,103 @@ def push_ocr_batch_to_snowflake(df: pd.DataFrame) -> str:
         return batch
     finally:
         session.close()
+
+
+def build_batch_qc_stats(df: pd.DataFrame) -> dict:
+    """Lightweight batch stats sent to Grok for automated QC (no raw images)."""
+    work = df.copy()
+    for col in [
+        "Sample ID", "Date Sampled", "Date Received",
+        "Machine", "Component", "Serial Number", "Reference Lube",
+    ]:
+        if col not in work.columns:
+            work[col] = None
+
+    sample_ids = work["Sample ID"].astype(str)
+    missing_sample_id = int(((sample_ids == "") | sample_ids.isna() | (sample_ids == "nan") | (sample_ids == "ERROR")).sum())
+    dup_ids = sample_ids[sample_ids.duplicated(keep=False) & ~sample_ids.isin(["", "nan", "ERROR", "None"])]
+    missing_fields = {
+        col: int(work[col].isna().sum() + (work[col].astype(str).str.strip() == "").sum())
+        for col in ["Date Sampled", "Machine", "Component", "Serial Number", "Reference Lube"]
+    }
+    failed = int(work.get("Status", pd.Series(dtype=str)).astype(str).str.startswith("Failed").sum()) if "Status" in work.columns else 0
+
+    preview_cols = [c for c in [
+        "Sample ID", "Date Sampled", "Date Received", "Machine", "Component",
+        "Serial Number", "Reference Lube",
+    ] if c in work.columns]
+    preview = work[preview_cols].head(15).fillna("").astype(str).to_dict(orient="records")
+
+    return {
+        "row_count": int(len(work)),
+        "failed_ocr_rows": failed,
+        "missing_or_error_sample_ids": missing_sample_id,
+        "duplicate_sample_id_count": int(dup_ids.nunique()),
+        "duplicate_sample_ids": sorted(dup_ids.dropna().astype(str).unique().tolist())[:20],
+        "missing_field_counts": missing_fields,
+        "preview_rows": preview,
+    }
+
+
+def run_grok_batch_qc(df: pd.DataFrame, batch_id: str | None = None) -> str:
+    """
+    Auto QC via xAI Grok chat completions.
+    XAI_API_KEY authenticates to https://api.x.ai/v1/chat/completions so Grok can
+    review batch stats and return a short readiness report.
+    """
+    if not XAI_API_KEY:
+        raise RuntimeError(
+            "XAI_API_KEY (or GROK_API_KEY) is not set — cannot run Grok automation."
+        )
+
+    stats = build_batch_qc_stats(df)
+    system = (
+        "You are Grok, the automated QC reviewer for MRG Laboratories sample intake. "
+        "Given batch statistics from OCR → Tiger Data → Snowflake, produce a concise "
+        "ops report. Flag missing entries, duplicate Sample IDs, and OCR failures. "
+        "End with a clear READY TO SUBMIT or NEEDS REVIEW decision and 2-4 bullet actions."
+    )
+    user = (
+        f"Batch ID: {batch_id or 'UNKNOWN'}\n"
+        f"Pipeline: Gemini OCR → Tiger Data → Snowflake STAGING_SAMPLES\n"
+        f"Stats JSON:\n{json.dumps(stats, default=str)}"
+    )
+
+    resp = requests.post(
+        "https://api.x.ai/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {XAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": GROK_MODEL,
+            "temperature": 0.2,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        },
+        timeout=60,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Grok API error {resp.status_code}: {resp.text[:500]}")
+
+    body = resp.json()
+    report = body["choices"][0]["message"]["content"].strip()
+
+    # Persist evidence for SpaceXSI / hackathon documentation
+    stamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(GROK_QC_LOG, "a", encoding="utf-8") as log:
+        log.write(
+            f"\n## Grok QC — {stamp}\n"
+            f"- Model: `{GROK_MODEL}`\n"
+            f"- Batch: `{batch_id or 'UNKNOWN'}`\n"
+            f"- Rows: {stats['row_count']}\n"
+            f"- Duplicates: {stats['duplicate_sample_id_count']}\n"
+            f"- Missing/error Sample IDs: {stats['missing_or_error_sample_ids']}\n\n"
+            f"{report}\n\n---\n"
+        )
+    return report
 
 
 def sf_query(session, sql: str, params=None) -> pd.DataFrame:
@@ -383,12 +487,24 @@ with tab1:
                 st.warning("TIGERDATA_URI is not set — skipped Tiger Data write.")
 
             # 2) Then send the same batch to Snowflake intake staging
+            batch_id = None
             try:
                 batch_id = push_ocr_batch_to_snowflake(df)
                 st.session_state.last_snowflake_batch = batch_id
                 st.toast(f"Synced batch {batch_id} to Snowflake")
             except Exception as e:
                 st.error(f"Failed to write to Snowflake: {e}")
+
+            # 3) Auto-run Grok QC automation on the finished batch
+            st.session_state.grok_qc_report = None
+            st.session_state.grok_qc_error = None
+            try:
+                with st.spinner("Grok automation: reviewing batch QC…"):
+                    st.session_state.grok_qc_report = run_grok_batch_qc(df, batch_id)
+                st.toast("Grok QC complete")
+            except Exception as e:
+                st.session_state.grok_qc_error = str(e)
+                st.warning(f"Grok automation skipped/failed: {e}")
 
             st.session_state.processed_df = df
             st.session_state.generated_csv = df.to_csv(index=False).encode('utf-8')
@@ -412,6 +528,18 @@ with tab1:
             file_name=st.session_state.csv_filename,
             mime="text/csv",
         )
+
+        # Grok automation output (auto-run after each Process All Labels)
+        st.markdown("#### 🤖 Grok Automation — Batch QC")
+        if st.session_state.grok_qc_report:
+            st.success("Grok auto-reviewed this batch after Tiger Data + Snowflake sync.")
+            st.markdown(st.session_state.grok_qc_report)
+            st.caption(f"Logged to `{GROK_QC_LOG}` · model `{GROK_MODEL}`")
+        elif st.session_state.grok_qc_error:
+            st.error(f"Grok QC error: {st.session_state.grok_qc_error}")
+            st.caption("Set `XAI_API_KEY` in the environment, then re-process a batch.")
+        else:
+            st.info("Grok QC will auto-run the next time you process labels.")
 
     # --- MINESWEEPER COMPONENT ---
     st.markdown("---")
