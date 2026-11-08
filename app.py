@@ -2,26 +2,50 @@ import streamlit as st
 import streamlit.components.v1 as components
 from google import genai
 import pandas as pd
-from datetime import date
+from datetime import date, datetime
 from PIL import Image
 import json
 import time
 import os
 import base64
+import hashlib
 import requests
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect as sa_inspect, text as sa_text, types as sa_types
 import snowflake.snowpark as snowpark
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 
-# Load local secrets from .env if present (file is gitignored)
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
+
+import asyncio
+from solana.rpc.async_api import AsyncClient
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from solders.instruction import Instruction
+from solders.message import MessageV0
+from solders.transaction import VersionedTransaction
+
+# ReportLab & OpenPyXL for PDF and Excel exports
+try:
+    from reportlab.lib.pagesizes import letter, landscape
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+    REPORTLAB_AVAILABLE = True
+except ImportError:
+    REPORTLAB_AVAILABLE = False
+
+try:
+    import openpyxl
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    OPENPYXL_AVAILABLE = False
 
 # _snowflake only exists in the warehouse runtime; local/container uses REST instead.
 try:
@@ -30,9 +54,13 @@ except ImportError:
     _snowflake = None
 
 # Configure the Streamlit page
-st.set_page_config(page_title="MRG Labs Label Scanner", layout="wide")
+st.set_page_config(
+    page_title="MRG Labs Sampler", 
+    page_icon="MRGLogo.png",  # Update this string to match your exact file name
+    layout="wide"
+)
 
-# Snowflake intake schema used by the Sample Intake review / Cortex Analyst chatbot
+# Snowflake intake schema used by the Sample Intake review
 DB_SCHEMA = os.environ.get("SNOWFLAKE_DB_SCHEMA", "MRG_LABS_DB.INTAKE")
 SF_DATABASE = os.environ.get("SNOWFLAKE_DATABASE", "MRG_LABS_DB")
 SF_SCHEMA = os.environ.get("SNOWFLAKE_SCHEMA", "INTAKE")
@@ -49,15 +77,57 @@ OCR_TO_SF = {
     "Component": "COMPONENT",
     "Serial Number": "SERIAL_NUMBER",
     "Reference Lube": "REFERENCE_LUBE",
+    "Tube Size": "TUBE_SIZE",
+}
+TUBE_HEADERS = ["TUBE_SIZE", "TUBE", "SIZE", "TUBE_TYPE"]
+TUBE_VALUES = {
+    "S": "SMALL", "SM": "SMALL", "SMALL": "SMALL",
+    "L": "LARGE", "LG": "LARGE", "LARGE": "LARGE",
+}
+ALL = "__ALL__"
+# Sample Intake (app2) copy
+INTAKE_TEXT = {
+    "title": "MRG Laboratories - Sample Intake",
+    "upload": "Upload weekly OCR output CSV",
+    "loaded": "Loaded {n} rows into batch {b}",
+    "batch": "Batch",
+    "samples": "Samples", "dups": "Duplicate IDs", "missing": "Missing fields",
+    "bad_dates": "Bad dates", "turnaround": "Avg turnaround (days)",
+    "tab_dash": "Dashboard", "tab_chat": "Ask the data",
+    "tab_fix": "Flagged samples", "tab_data": "Data",
+    "per_day": "Samples received per day", "per_machine": "Samples per machine",
+    "per_component": "Samples per component", "per_tube": "Small vs Large tubes",
+    "chat_hint": "Ask a question, e.g. 'Which machines have the longest turnaround?'",
+    "dup_alert": "{n} rows share a Sample ID and are flagged - see the Flagged samples tab.",
+    "no_issues": "No flagged samples - ready to submit.",
+    "save": "Save flag changes", "saved": "Flag changes saved.",
+    "unflag_col": "Unflag",
+    "unflag_hint": "Tick 'Unflag' to clear a flag (untick to re-flag), then save.",
+    "submit": "Submit to MRG",
+    "submitted": "Your data has been submitted to MRG: {n} samples ({f} flagged for review).",
+    "popup_title": "Submitted to MRG",
+    "flag_note": "{n} samples are flagged. Labels can't be corrected - they will be submitted with their flag.",
+    "nothing": "No pending samples in this batch.",
+    "feed": "Server feed", "feed_mode": "Mode", "feed_source": "Source",
+    "feed_last": "Last pull", "feed_new": "Rows imported (last pull)",
+    "feed_total": "Server rows read so far",
+    "feed_pull": "Pull from server now", "feed_sim": "Simulate new server rows",
+    "feed_sim_n": "Rows to add", "feed_never": "Never",
+    "feed_err": "Last pull failed: {e}",
+    "feed_history": "Recent pulls",
+    "all_batches": "All batches", "unknown": "Unknown",
+    "submit_pick": "Pick a single batch to submit.",
 }
 
-# Inject MRG Labs CSS Theme and Custom Behaviors
+# Inject MRG Labs CSS Theme, Bento Box Layout, and Spinning Loading Circle
 st.markdown("""
     <style>
         /* MRG Labs Brand Styling */
         :root {
             --mrg-blue: #004B87;
             --mrg-light-blue: #005A9E;
+            --mrg-bg-gray: #f8fafc;
+            --mrg-border: #e2e8f0;
         }
         h1, h2, h3, h4 {
             color: var(--mrg-blue) !important;
@@ -121,6 +191,110 @@ st.markdown("""
         }
         #close-alert { display: none; }
         #close-alert:checked ~ .alert-box { display: none; }
+
+        /* Prevent Streamlit from fading out elements (like Minesweeper) while processing */
+        [data-testid="stComponentBlock"], [data-testid="stComponentBlock"] iframe, .stElementContainer {
+            opacity: 1 !important;
+            transition: none !important;
+            filter: none !important;
+        }
+
+        /* OVERALL: Replace Streamlit default running indicator (running people/man) with a sleek spinning loading circle */
+        [data-testid="stStatusWidget"] svg,
+        [data-testid="stStatusWidget"] img,
+        [data-testid="stStatusWidget"] [data-testid="stIconMaterial"],
+        .stStatusWidget svg,
+        .stStatusWidget img {
+            display: none !important;
+        }
+
+        [data-testid="stStatusWidget"] button,
+        .stStatusWidget button {
+            display: inline-flex !important;
+            align-items: center !important;
+        }
+
+        [data-testid="stStatusWidget"] button::before,
+        [data-testid="stStatusWidget"]::before,
+        .stStatusWidget::before {
+            content: "" !important;
+            display: inline-block !important;
+            width: 16px !important;
+            height: 16px !important;
+            border: 2.5px solid rgba(0, 75, 135, 0.25) !important;
+            border-top: 2.5px solid #004B87 !important;
+            border-radius: 50% !important;
+            animation: mrg-spin 0.75s linear infinite !important;
+            margin-right: 8px !important;
+            flex-shrink: 0 !important;
+        }
+
+        @keyframes mrg-spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        /* Minimalist Bento Box SaaS Dashboard Styling */
+        .bento-card {
+            background-color: #ffffff;
+            border: 1px solid #e2e8f0;
+            border-radius: 12px;
+            padding: 18px 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.03), 0 1px 2px rgba(0,0,0,0.02);
+            transition: all 0.2s ease;
+            height: 100%;
+        }
+        .bento-card:hover {
+            border-color: #cbd5e1;
+            box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05);
+        }
+        .bento-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        .bento-title {
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #64748b;
+        }
+        .bento-metric {
+            font-size: 26px;
+            font-weight: 700;
+            color: #0f172a;
+            letter-spacing: -0.02em;
+            line-height: 1.2;
+        }
+        .bento-subtitle {
+            font-size: 12px;
+            color: #64748b;
+            margin-top: 4px;
+        }
+        .bento-badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 3px 8px;
+            border-radius: 9999px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        .bento-badge-success { background-color: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; }
+        .bento-badge-warning { background-color: #fffbeb; color: #b45309; border: 1px solid #fde68a; }
+        .bento-badge-danger  { background-color: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
+        .bento-badge-info    { background-color: #eff6ff; color: #1d4ed8; border: 1px solid #bfdbfe; }
+
+        .bento-ai-container {
+            background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
+            border: 1px solid #cbd5e1;
+            border-left: 4px solid #004B87;
+            border-radius: 12px;
+            padding: 20px;
+            margin-top: 15px;
+            margin-bottom: 15px;
+        }
     </style>
 """, unsafe_allow_html=True)
 
@@ -139,6 +313,12 @@ if 'last_snowflake_batch' not in st.session_state:
     st.session_state.last_snowflake_batch = None
 if 'msgs' not in st.session_state:
     st.session_state.msgs = []
+if 'ai_grease_analysis' not in st.session_state:
+    st.session_state.ai_grease_analysis = None
+if 'sf_msgs' not in st.session_state:
+    st.session_state.sf_msgs = []
+if 'chat_batch' not in st.session_state:
+    st.session_state.chat_batch = None
 if 'grok_qc_report' not in st.session_state:
     st.session_state.grok_qc_report = None
 if 'grok_qc_error' not in st.session_state:
@@ -161,8 +341,948 @@ def get_image_base64(image):
     return base64.b64encode(buffered.getvalue()).decode()
 
 
+def safe_parse_dates(series: pd.Series) -> pd.Series:
+    """Robust date parsing across all pandas versions."""
+    try:
+        return pd.to_datetime(series, format='mixed', errors='coerce').dt.date
+    except Exception:
+        return pd.to_datetime(series, errors='coerce').dt.date
+
+
+def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    """Convert DataFrame to Excel (.xlsx) bytes."""
+    buffer = BytesIO()
+    clean_df = df.copy()
+    if "Solana Audit Trail" in clean_df.columns:
+        clean_df = clean_df.drop(columns=["Solana Audit Trail"])
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        clean_df.to_excel(writer, index=False, sheet_name='Visible Samples')
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def df_to_pdf_bytes(df: pd.DataFrame, title="MRG Labs - Visible Grease Samples") -> bytes:
+    """Convert DataFrame to formatted PDF report bytes."""
+    if not REPORTLAB_AVAILABLE:
+        return b"%PDF-1.4 Empty fallback"
+    
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=landscape(letter),
+        leftMargin=15,
+        rightMargin=15,
+        topMargin=20,
+        bottomMargin=20
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        'DocTitle',
+        parent=styles['Heading2'],
+        fontSize=13,
+        textColor=colors.HexColor('#004B87'),
+        spaceAfter=8
+    )
+    elements = [
+        Paragraph(f"<b>{title}</b> — Visible records: {len(df)}", title_style),
+        Spacer(1, 6)
+    ]
+    
+    cell_style = ParagraphStyle(
+        'Cell',
+        fontSize=7,
+        leading=9,
+        textColor=colors.HexColor('#1E293B')
+    )
+    header_style = ParagraphStyle(
+        'Header',
+        fontSize=8,
+        leading=10,
+        textColor=colors.whitesmoke,
+        fontName='Helvetica-Bold'
+    )
+    
+    export_df = df.copy()
+    if "Solana Audit Trail" in export_df.columns:
+        export_df = export_df.drop(columns=["Solana Audit Trail"])
+        
+    headers = [Paragraph(f"<b>{str(col)}</b>", header_style) for col in export_df.columns]
+    table_data = [headers]
+    
+    for _, row in export_df.iterrows():
+        row_cells = []
+        for val in row:
+            text = "" if (pd.isna(val) or val is None) else str(val)
+            if len(text) > 75:
+                text = text[:72] + "..."
+            row_cells.append(Paragraph(text, cell_style))
+        table_data.append(row_cells)
+        
+    num_cols = max(len(export_df.columns), 1)
+    col_width = (doc.width) / num_cols
+    
+    t = Table(table_data, colWidths=[col_width] * num_cols, repeatRows=1)
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#004B87')),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ('TOPPADDING', (0, 0), (-1, -1), 3),
+        ('LEFTPADDING', (0, 0), (-1, -1), 3),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 3),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.HexColor('#F8FAFC'), colors.white]),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#CBD5E1')),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+    ]))
+    elements.append(t)
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def call_reasoning_model(client, prompt: str) -> str:
+    """Queries Google Gemini high-level reasoning model with fallback capability."""
+    preferred_models = [
+        os.environ.get("GEMINI_REASONING_MODEL", "gemini-3.7-flash"),
+        "gemini-3.5-flash",
+        "gemini-flash-latest",
+    ]
+    models = []
+    for m in preferred_models:
+        if m and m not in models:
+            models.append(m)
+
+    errors = []
+    for model_name in models:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt
+            )
+            if response and response.text:
+                return response.text
+            errors.append(f"{model_name}: empty response")
+        except Exception as e:
+            errors.append(f"{model_name}: {e}")
+            continue
+
+    raise RuntimeError("All reasoning models failed:\n" + "\n".join(errors))
+
+
+def normalize_col_name(c: str) -> str:
+    return c.strip().upper().replace(" ", "_")
+
+
+def validate_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Validates a DataFrame of grease samples according to MRG Labs rules,
+    strictly differentiating between Small and Large tube sizes to avoid incorrect flags.
+    """
+    df = df.copy()
+    col_map = {c: normalize_col_name(c) for c in df.columns}
+    std_df = df.rename(columns=col_map).copy()
+    
+    for c in ["SAMPLE_ID", "DATE_SAMPLED", "DATE_RECEIVED", "MACHINE", "COMPONENT", "SERIAL_NUMBER", "REFERENCE_LUBE"]:
+        if c not in std_df.columns:
+            std_df[c] = None
+    if "TUBE_SIZE" not in std_df.columns:
+        std_df["TUBE_SIZE"] = None
+
+    tube_sizes = []
+    missing_flags = []
+    missing_reasons = []
+    bad_date_flags = []
+    bad_date_reasons = []
+    turnarounds = []
+    
+    # 1. Determine Tube Size (Small vs Large)
+    for idx, row in std_df.iterrows():
+        raw_ts = str(row["TUBE_SIZE"]).strip().lower() if pd.notna(row["TUBE_SIZE"]) else ""
+        if "small" in raw_ts or raw_ts == "s":
+            t_size = "Small"
+        elif "large" in raw_ts or raw_ts == "l":
+            t_size = "Large"
+        else:
+            sn = str(row["SERIAL_NUMBER"]).strip() if pd.notna(row["SERIAL_NUMBER"]) else ""
+            rl = str(row["REFERENCE_LUBE"]).strip() if pd.notna(row["REFERENCE_LUBE"]) else ""
+            has_sn = sn not in ["", "None", "nan", "NaT", "<NA>", "ERROR"]
+            has_rl = rl not in ["", "None", "nan", "NaT", "<NA>", "ERROR"]
+            
+            if has_sn and not has_rl:
+                t_size = "Small"
+            elif has_rl and not has_sn:
+                t_size = "Large"
+            else:
+                comp = str(row["COMPONENT"]).strip().upper() if pd.notna(row["COMPONENT"]) else ""
+                if "GS" in comp or "NGS" in comp:
+                    t_size = "Small"
+                else:
+                    t_size = "Large"
+        tube_sizes.append(t_size)
+    std_df["TUBE_SIZE"] = tube_sizes
+    
+    # 2. Check Duplicate Sample IDs
+    valid_ids = std_df["SAMPLE_ID"].dropna().astype(str).str.strip()
+    valid_ids = valid_ids[~valid_ids.isin(["", "None", "nan", "NaT", "ERROR"])]
+    dup_counts = valid_ids.value_counts()
+    dup_id_set = set(dup_counts[dup_counts > 1].index)
+    
+    is_duplicate = []
+    for idx, row in std_df.iterrows():
+        sid = str(row["SAMPLE_ID"]).strip() if pd.notna(row["SAMPLE_ID"]) else ""
+        is_dup = sid in dup_id_set
+        is_duplicate.append(is_dup)
+    std_df["IS_DUPLICATE"] = is_duplicate
+    
+    # 3. Validate Required Fields & Dates based on Tube Size
+    today = date.today()
+    for idx, row in std_df.iterrows():
+        t_size = row["TUBE_SIZE"]
+        m_list = []
+        d_reasons = []
+        
+        # Universal required fields
+        sid = str(row["SAMPLE_ID"]).strip() if pd.notna(row["SAMPLE_ID"]) else ""
+        if not sid or sid in ["None", "nan", "NaT", "<NA>", "ERROR"]:
+            m_list.append("Sample ID")
+            
+        mach = str(row["MACHINE"]).strip() if pd.notna(row["MACHINE"]) else ""
+        if not mach or mach in ["None", "nan", "NaT", "<NA>"]:
+            m_list.append("Machine")
+            
+        comp = str(row["COMPONENT"]).strip() if pd.notna(row["COMPONENT"]) else ""
+        if not comp or comp in ["None", "nan", "NaT", "<NA>"]:
+            m_list.append("Component")
+            
+        # Field differentiation based on tube size
+        if t_size == "Small":
+            # Small tube: requires Date Sampled, Serial Number; Reference Lube is omitted
+            ds = str(row["DATE_SAMPLED"]).strip() if pd.notna(row["DATE_SAMPLED"]) else ""
+            if not ds or ds in ["None", "nan", "NaT", "<NA>"]:
+                m_list.append("Date Sampled")
+                
+            sn = str(row["SERIAL_NUMBER"]).strip() if pd.notna(row["SERIAL_NUMBER"]) else ""
+            if not sn or sn in ["None", "nan", "NaT", "<NA>"]:
+                m_list.append("Serial Number")
+        else:
+            # Large tube: requires Reference Lube; Serial Number is omitted
+            rl = str(row["REFERENCE_LUBE"]).strip() if pd.notna(row["REFERENCE_LUBE"]) else ""
+            if not rl or rl in ["None", "nan", "NaT", "<NA>"]:
+                m_list.append("Reference Lube")
+                
+        # Dates validation & turnaround
+        d_samp = None
+        d_recv = None
+        
+        ds_val = row["DATE_SAMPLED"]
+        if pd.notna(ds_val) and str(ds_val).strip() not in ["", "None", "nan", "NaT"]:
+            try:
+                parsed_s = safe_parse_dates(pd.Series([ds_val])).iloc[0]
+                if pd.notna(parsed_s):
+                    d_samp = parsed_s
+                    if d_samp > today:
+                        d_reasons.append("Sampled date in future")
+                    elif d_samp < date(2000, 1, 1):
+                        d_reasons.append("Sampled date before 2000")
+                else:
+                    d_reasons.append("Invalid Date Sampled format")
+            except Exception:
+                d_reasons.append("Invalid Date Sampled format")
+                
+        dr_val = row["DATE_RECEIVED"]
+        if pd.notna(dr_val) and str(dr_val).strip() not in ["", "None", "nan", "NaT"]:
+            try:
+                parsed_r = safe_parse_dates(pd.Series([dr_val])).iloc[0]
+                if pd.notna(parsed_r):
+                    d_recv = parsed_r
+                    if d_recv > today:
+                        d_reasons.append("Received date in future")
+                else:
+                    d_reasons.append("Invalid Date Received format")
+            except Exception:
+                d_reasons.append("Invalid Date Received format")
+                
+        if d_samp and d_recv:
+            turnaround_days = (d_recv - d_samp).days
+            if turnaround_days < 0:
+                d_reasons.append("Sampled date is after Received date")
+                turnarounds.append(None)
+            else:
+                turnarounds.append(turnaround_days)
+        else:
+            turnarounds.append(None)
+            
+        missing_flags.append(len(m_list) > 0)
+        missing_reasons.append(", ".join(m_list) if m_list else "")
+        bad_date_flags.append(len(d_reasons) > 0)
+        bad_date_reasons.append(", ".join(d_reasons) if d_reasons else "")
+
+    std_df["HAS_MISSING_FIELD"] = missing_flags
+    std_df["MISSING_REASONS"] = missing_reasons
+    std_df["HAS_BAD_DATE"] = bad_date_flags
+    std_df["BAD_DATE_REASONS"] = bad_date_reasons
+    std_df["TURNAROUND_DAYS"] = turnarounds
+    
+    std_df["IS_FLAGGED"] = std_df["IS_DUPLICATE"] | std_df["HAS_MISSING_FIELD"] | std_df["HAS_BAD_DATE"]
+    
+    flag_reasons = []
+    for is_dup, m_r, b_r in zip(std_df["IS_DUPLICATE"], std_df["MISSING_REASONS"], std_df["BAD_DATE_REASONS"]):
+        parts = []
+        if is_dup:
+            parts.append("Duplicate ID")
+        if m_r:
+            parts.append(f"Missing: {m_r}")
+        if b_r:
+            parts.append(f"Date issue: {b_r}")
+        flag_reasons.append("; ".join(parts) if parts else "None")
+    std_df["FLAG_REASON"] = flag_reasons
+    
+    return std_df
+
+
+def get_styled_dataframe(df_view: pd.DataFrame):
+    """Applies soft red highlights strictly to cells that violated rules for their tube size."""
+    cols = ["SAMPLE_ID", "TUBE_SIZE", "FLAG_REASON", "DATE_SAMPLED", "DATE_RECEIVED", "MACHINE", "COMPONENT", "SERIAL_NUMBER", "REFERENCE_LUBE", "TURNAROUND_DAYS"]
+    existing_cols = [c for c in cols if c in df_view.columns]
+    view_sub = df_view[existing_cols].copy()
+    
+    def highlight_row_cells(df):
+        styles = pd.DataFrame('', index=df.index, columns=df.columns)
+        red_bg = 'background-color: #fee2e2; color: #991b1b; font-weight: 500;'
+        
+        for idx in df.index:
+            row_data = df_view.loc[idx]
+            is_dup = row_data.get("IS_DUPLICATE", False)
+            has_bad_date = row_data.get("HAS_BAD_DATE", False)
+            t_size = row_data.get("TUBE_SIZE", "Large")
+            
+            if is_dup and "SAMPLE_ID" in df.columns:
+                styles.at[idx, "SAMPLE_ID"] = red_bg
+            if has_bad_date and "DATE_SAMPLED" in df.columns:
+                styles.at[idx, "DATE_SAMPLED"] = red_bg
+                
+            for col in ["SAMPLE_ID", "MACHINE", "COMPONENT"]:
+                if col in df.columns:
+                    v = row_data.get(col)
+                    if pd.isna(v) or not str(v).strip() or str(v).strip() in ["None", "nan", "NaT", "<NA>", "ERROR"]:
+                        styles.at[idx, col] = red_bg
+                        
+            if t_size == "Small":
+                for col in ["DATE_SAMPLED", "SERIAL_NUMBER"]:
+                    if col in df.columns:
+                        v = row_data.get(col)
+                        if pd.isna(v) or not str(v).strip() or str(v).strip() in ["None", "nan", "NaT", "<NA>"]:
+                            styles.at[idx, col] = red_bg
+            else:
+                if "REFERENCE_LUBE" in df.columns:
+                    v = row_data.get("REFERENCE_LUBE")
+                    if pd.isna(v) or not str(v).strip() or str(v).strip() in ["None", "nan", "NaT", "<NA>"]:
+                        styles.at[idx, "REFERENCE_LUBE"] = red_bg
+                        
+        return styles
+
+    return view_sub.style.apply(highlight_row_cells, axis=None)
+
+
+
+# ---------- Tab 3: cell-level flags, manual edits, Tiger Data write-back ----------
+GRID_HTML = r'''<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root { --brand:#004B87; --line:#e2e8f0; --bg:#fff; --head:#f1f5f9; --txt:#0f172a; --mut:#64748b;
+          --red-bg:#fee2e2; --red-tx:#991b1b; }
+  * { box-sizing:border-box; }
+  html, body { margin:0; padding:0; font-family:"Source Sans Pro", system-ui, -apple-system, "Segoe UI", sans-serif;
+               font-size:13px; color:var(--txt); background:transparent; }
+  #wrap { display:flex; flex-direction:column; height:100vh; }
+  #hint { color:var(--mut); font-size:12px; padding:2px 2px 6px; }
+  #scroller { flex:1; overflow:auto; border:1px solid var(--line); border-radius:8px; background:var(--bg); }
+  table { border-collapse:separate; border-spacing:0; width:100%; }
+  th { position:sticky; top:0; z-index:2; background:var(--head); text-align:left; font-weight:600;
+       padding:7px 10px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  td { padding:6px 10px; border-bottom:1px solid #f1f5f9; white-space:nowrap; max-width:320px;
+       overflow:hidden; text-overflow:ellipsis; cursor:default; height:31px; }
+  td.ro { color:#475569; }
+  td.flag { background:var(--red-bg); color:var(--red-tx); font-weight:500; }
+  td.edited { box-shadow:inset 3px 0 0 var(--brand); font-style:italic; }
+  td.flagchg { outline:2px dashed #f59e0b; outline-offset:-2px; }
+  td.editing { padding:0; }
+  td input { width:100%; height:30px; border:2px solid var(--brand); outline:none; padding:0 8px;
+             font:inherit; background:#fff; color:var(--txt); }
+  tr:hover td:not(.flag) { background:#f8fafc; }
+  #menu { position:fixed; display:none; z-index:50; min-width:170px; background:#fff; border:1px solid var(--line);
+          border-radius:8px; box-shadow:0 8px 24px rgba(15,23,42,.18); padding:4px; }
+  #menu div { padding:7px 12px; border-radius:5px; cursor:pointer; user-select:none; }
+  #menu div:hover { background:#eff6ff; }
+  #menu div.dis { color:#94a3b8; cursor:not-allowed; background:none; }
+  #foot { display:flex; justify-content:space-between; align-items:center; height:48px; padding-top:8px; }
+  #pending { color:var(--mut); font-size:12px; visibility:hidden; }
+  #btns { display:flex; gap:8px; visibility:hidden; }
+  #foot.dirty #pending, #foot.dirty #btns { visibility:visible; }
+  button { font:inherit; font-weight:600; border-radius:6px; padding:7px 18px; cursor:pointer; border:1px solid var(--line); }
+  #cancel { background:#fff; color:var(--txt); }
+  #cancel:hover { background:#f1f5f9; }
+  #save { background:var(--brand); color:#fff; border-color:var(--brand); }
+  #save:hover { filter:brightness(1.1); }
+  button:disabled { opacity:.55; cursor:wait; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="hint">Right-click a cell to edit, flag, or unflag it. Double-click also edits.</div>
+  <div id="scroller"><table id="tbl"></table></div>
+  <div id="foot">
+    <span id="pending"></span>
+    <span id="btns">
+      <button id="cancel">Cancel</button>
+      <button id="save">Save</button>
+    </span>
+  </div>
+</div>
+<div id="menu"></div>
+
+<script>
+(function () {
+  // ---- Streamlit component protocol (no build step needed) ----
+  function send(type, data) {
+    window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data), "*");
+  }
+  var S = { rows: [], columns: [], editable: [], flags: {}, version: null };
+  var pendingEdits = {};   // "row|col" -> {row, col, value}
+  var pendingFlags = {};   // "row|col" -> desired boolean (only when differs from original)
+  var saving = false, saveTimer = null, ctx = null;
+
+  var $tbl = document.getElementById("tbl"), $menu = document.getElementById("menu"),
+      $foot = document.getElementById("foot"), $pending = document.getElementById("pending");
+
+  var key = function (r, c) { return r + "|" + c; };
+  var origVal = function (row, c) { var v = row[c]; return v == null ? "" : String(v); };
+  var origFlag = function (r, c) { return !!(S.flags[r] && S.flags[r][c]); };
+  var curFlag = function (r, c) { var k = key(r, c); return k in pendingFlags ? pendingFlags[k] : origFlag(r, c); };
+
+  function dirtyCount() { return Object.keys(pendingEdits).length + Object.keys(pendingFlags).length; }
+
+  function render() {
+    var h = "<thead><tr>" + S.columns.map(function (c) {
+      return "<th>" + esc(c.replace(/_/g, " ")) + "</th>";
+    }).join("") + "</tr></thead><tbody>";
+    S.rows.forEach(function (row) {
+      var r = row._i;
+      h += "<tr>";
+      S.columns.forEach(function (c) {
+        var k = key(r, c), cls = [], tip = "";
+        var edited = k in pendingEdits;
+        var val = edited ? pendingEdits[k].value : origVal(row, c);
+        if (S.editable.indexOf(c) < 0) cls.push("ro");
+        if (curFlag(r, c)) {
+          cls.push("flag");
+          tip = (S.flags[r] && S.flags[r][c]) || "Manually flagged";
+        }
+        if (edited) cls.push("edited");
+        if (k in pendingFlags) cls.push("flagchg");
+        h += '<td class="' + cls.join(" ") + '" data-r="' + r + '" data-c="' + c + '"' +
+             (tip ? ' title="' + esc(tip) + '"' : "") + ">" + esc(val) + "</td>";
+      });
+      h += "</tr>";
+    });
+    $tbl.innerHTML = h + "</tbody>";
+
+    var n = dirtyCount();
+    $foot.className = n ? "dirty" : "";
+    $pending.textContent = n + " unsaved change" + (n === 1 ? "" : "s");
+    document.getElementById("save").disabled = saving;
+    document.getElementById("cancel").disabled = saving;
+    document.getElementById("save").textContent = saving ? "Saving…" : "Save";
+    var want = Math.min(S.rows.length * 31 + 38, 520) + 30 + 48 + 14;
+    send("streamlit:setFrameHeight", { height: want });
+  }
+
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, function (m) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m];
+    });
+  }
+
+  // ---- editing ----
+  function startEdit(td) {
+    var r = +td.dataset.r, c = td.dataset.c;
+    if (S.editable.indexOf(c) < 0) return;
+    var row = S.rows.filter(function (x) { return x._i === r; })[0];
+    var k = key(r, c);
+    var start = k in pendingEdits ? pendingEdits[k].value : origVal(row, c);
+    td.className = "editing";
+    td.innerHTML = '<input type="text" value="' + esc(start) + '">';
+    var inp = td.firstChild; inp.focus(); inp.select();
+    var done = false;
+    function commit(save) {
+      if (done) return; done = true;
+      if (save) {
+        var v = inp.value.trim();
+        if (v === origVal(row, c).trim()) delete pendingEdits[k];
+        else pendingEdits[k] = { row: r, col: c, value: v };
+      }
+      render();
+    }
+    inp.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") commit(true);
+      else if (e.key === "Escape") commit(false);
+    });
+    inp.addEventListener("blur", function () { commit(true); });
+  }
+
+  function toggleFlag(r, c) {
+    var k = key(r, c), want = !curFlag(r, c);
+    if (want === origFlag(r, c)) delete pendingFlags[k]; else pendingFlags[k] = want;
+    render();
+  }
+
+  // ---- context menu ----
+  function openMenu(e, td) {
+    e.preventDefault();
+    var r = +td.dataset.r, c = td.dataset.c, k = key(r, c);
+    var canEdit = S.editable.indexOf(c) >= 0, flagged = curFlag(r, c);
+    var items = [
+      { label: "✏️  Edit cell", on: canEdit, fn: function () { startEdit(td); } },
+      { label: flagged ? "⚐  Unflag cell" : "⚑  Flag cell", on: true, fn: function () { toggleFlag(r, c); } }
+    ];
+    if (k in pendingEdits || k in pendingFlags) {
+      items.push({ label: "↩  Revert this cell", on: true, fn: function () {
+        delete pendingEdits[k]; delete pendingFlags[k]; render(); } });
+    }
+    $menu.innerHTML = "";
+    items.forEach(function (it) {
+      var d = document.createElement("div");
+      d.textContent = it.label;
+      if (!it.on) d.className = "dis";
+      d.addEventListener("click", function (ev) {
+        ev.stopPropagation(); if (!it.on) return; hideMenu(); it.fn();
+      });
+      $menu.appendChild(d);
+    });
+    $menu.style.display = "block";
+    var w = $menu.offsetWidth, hgt = $menu.offsetHeight;
+    $menu.style.left = Math.max(0, Math.min(e.clientX, window.innerWidth - w - 4)) + "px";
+    $menu.style.top = Math.max(0, Math.min(e.clientY, window.innerHeight - hgt - 4)) + "px";
+  }
+  function hideMenu() { $menu.style.display = "none"; }
+
+  document.addEventListener("click", hideMenu);
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape") hideMenu(); });
+  document.getElementById("scroller").addEventListener("scroll", hideMenu);
+  $tbl.addEventListener("contextmenu", function (e) {
+    var td = e.target.closest("td"); if (td && td.dataset.r !== undefined) openMenu(e, td);
+  });
+  $tbl.addEventListener("dblclick", function (e) {
+    var td = e.target.closest("td"); if (td && td.dataset.r !== undefined) startEdit(td);
+  });
+
+  // ---- save / cancel ----
+  document.getElementById("cancel").addEventListener("click", function () {
+    pendingEdits = {}; pendingFlags = {}; render();   // back to exactly how it was
+  });
+  document.getElementById("save").addEventListener("click", function () {
+    if (saving || !dirtyCount()) return;
+    saving = true; render();
+    send("streamlit:setComponentValue", { dataType: "json", value: {
+      action: "save",
+      token: Date.now() + "-" + Math.random().toString(36).slice(2),
+      version: S.version,
+      edits: Object.keys(pendingEdits).map(function (k) { return pendingEdits[k]; }),
+      flags: Object.keys(pendingFlags).map(function (k) {
+        var p = k.split("|"); return { row: +p[0], col: p.slice(1).join("|"), flagged: pendingFlags[k] };
+      })
+    }});
+    clearTimeout(saveTimer);
+    // If Python rejects the save (error), version never changes: unlock the buttons.
+    saveTimer = setTimeout(function () { saving = false; render(); }, 8000);
+  });
+
+  // ---- receive data from Python ----
+  window.addEventListener("message", function (e) {
+    if (!e.data || e.data.type !== "streamlit:render") return;
+    var a = e.data.args || {};
+    var newVersion = a.version;
+    if (S.version !== null && newVersion !== S.version) {   // dataset changed or save succeeded
+      pendingEdits = {}; pendingFlags = {}; saving = false; clearTimeout(saveTimer);
+    }
+    S.rows = a.rows || []; S.columns = a.columns || []; S.editable = a.editable || [];
+    S.flags = a.flags || {}; S.version = newVersion;
+    if (!document.activeElement || document.activeElement.tagName !== "INPUT") render();
+  });
+
+  send("streamlit:componentReady", { apiVersion: 1 });
+})();
+</script>
+</body>
+</html>
+'''
+
+
+def _ensure_grid_dir() -> str:
+    """Writes the embedded grid component to disk (next to app.py, else the temp dir)."""
+    import tempfile
+    for base in (os.path.dirname(os.path.abspath(__file__)), tempfile.gettempdir()):
+        d = os.path.join(base, "grid_editor")
+        try:
+            os.makedirs(d, exist_ok=True)
+            f = os.path.join(d, "index.html")
+            if not os.path.exists(f) or open(f, encoding="utf-8").read() != GRID_HTML:
+                with open(f, "w", encoding="utf-8") as fh:
+                    fh.write(GRID_HTML)
+            return d
+        except OSError:
+            continue
+    raise RuntimeError("Could not create the grid_editor component folder (no writable directory).")
+
+
+GRID_DIR = _ensure_grid_dir()
+grid_editor = components.declare_component("mrg_grid_editor", path=GRID_DIR)
+
+GRID_COLS = ["SAMPLE_ID", "TUBE_SIZE", "FLAG_REASON", "DATE_SAMPLED", "DATE_RECEIVED",
+             "MACHINE", "COMPONENT", "SERIAL_NUMBER", "REFERENCE_LUBE", "TURNAROUND_DAYS"]
+# Columns stored in Tiger Data lab_samples (normalized names) -> user can edit these
+DB_EDIT_COLS = ["SAMPLE_ID", "DATE_SAMPLED", "DATE_RECEIVED", "MACHINE", "COMPONENT",
+                "SERIAL_NUMBER", "REFERENCE_LUBE"]
+COL_LABELS = {
+    "SAMPLE_ID": "Sample ID", "DATE_SAMPLED": "Date Sampled", "DATE_RECEIVED": "Date Received",
+    "MACHINE": "Machine", "COMPONENT": "Component", "SERIAL_NUMBER": "Serial Number",
+    "REFERENCE_LUBE": "Reference Lube",
+}
+_BLANK_VALS = {"", "None", "nan", "NaT", "<NA>"}
+
+
+def _is_blank(v) -> bool:
+    return v is None or (not isinstance(v, str) and pd.isna(v)) or str(v).strip() in _BLANK_VALS
+
+
+def _disp(v) -> str:
+    return "" if _is_blank(v) else str(v)
+
+
+def compute_cell_flags(df: pd.DataFrame) -> dict:
+    """Maps each rule violation in a validated df to the cell that caused it.
+    Returns {(row_idx, COL): [(kind, text), ...]}; kind in dup | missing | date | manual."""
+    cells = {}
+
+    def add(i, col, kind, text):
+        cells.setdefault((i, col), []).append((kind, text))
+
+    for i, row in df.iterrows():
+        if bool(row.get("IS_DUPLICATE", False)):
+            add(i, "SAMPLE_ID", "dup", "Duplicate ID")
+        sid = row.get("SAMPLE_ID")
+        if _is_blank(sid) or str(sid).strip() == "ERROR":
+            add(i, "SAMPLE_ID", "missing", COL_LABELS["SAMPLE_ID"])
+        for col in ("MACHINE", "COMPONENT"):
+            if _is_blank(row.get(col)):
+                add(i, col, "missing", COL_LABELS[col])
+        if row.get("TUBE_SIZE") == "Small":
+            for col in ("DATE_SAMPLED", "SERIAL_NUMBER"):
+                if _is_blank(row.get(col)):
+                    add(i, col, "missing", COL_LABELS[col])
+        elif _is_blank(row.get("REFERENCE_LUBE")):
+            add(i, "REFERENCE_LUBE", "missing", COL_LABELS["REFERENCE_LUBE"])
+        for reason in [r.strip() for r in str(row.get("BAD_DATE_REASONS", "") or "").split(",") if r.strip()]:
+            if "after Received" in reason:
+                add(i, "DATE_SAMPLED", "date", reason)
+                add(i, "DATE_RECEIVED", "date", reason)
+            elif "Sampled" in reason:
+                add(i, "DATE_SAMPLED", "date", reason)
+            elif "Received" in reason:
+                add(i, "DATE_RECEIVED", "date", reason)
+    return cells
+
+
+def apply_flag_overrides(data: pd.DataFrame, overrides: dict):
+    """Applies manual flag/unflag overrides, then recomputes row-level flag columns.
+    Returns (data, effective_cells)."""
+    auto = compute_cell_flags(data)
+    eff = {k: list(v) for k, v in auto.items()}
+    for (i, col), forced in overrides.items():
+        if forced:
+            eff.setdefault((i, col), [("manual", "Manually flagged")])
+        else:
+            eff.pop((i, col), None)
+    if not overrides:
+        return data, eff
+
+    data = data.copy()
+    touched = {i for (i, _c) in overrides}
+    for i in touched:
+        if i not in data.index:
+            continue
+        row_items = [(c, it) for (ri, c), items in eff.items() if ri == i for it in items]
+        dup = any(k == "dup" for _c, (k, _t) in row_items)
+        missing = [t for _c, (k, t) in row_items if k == "missing"]
+        dates = list(dict.fromkeys(t for _c, (k, t) in row_items if k == "date"))
+        manual = [COL_LABELS.get(c, c) for c, (k, _t) in row_items if k == "manual"]
+        data.at[i, "IS_DUPLICATE"] = dup
+        data.at[i, "HAS_MISSING_FIELD"] = bool(missing)
+        data.at[i, "MISSING_REASONS"] = ", ".join(missing)
+        data.at[i, "HAS_BAD_DATE"] = bool(dates)
+        data.at[i, "BAD_DATE_REASONS"] = ", ".join(dates)
+        parts = []
+        if dup:
+            parts.append("Duplicate ID")
+        if missing:
+            parts.append("Missing: " + ", ".join(missing))
+        if dates:
+            parts.append("Date issue: " + ", ".join(dates))
+        if manual:
+            parts.append("Manually flagged: " + ", ".join(manual))
+        data.at[i, "FLAG_REASON"] = "; ".join(parts) if parts else "None"
+        data.at[i, "IS_FLAGGED"] = bool(row_items)
+    return data, eff
+
+
+def tab3_signature(df: pd.DataFrame) -> str:
+    return hashlib.md5(pd.util.hash_pandas_object(df.astype(str), index=False).values.tobytes()).hexdigest()
+
+
+def get_tab3_state(sig: str) -> dict:
+    """Session-held edits + flag overrides for the dataset currently loaded in tab 3."""
+    s = st.session_state.get("tab3_edit_state")
+    if not s or s["sig"] != sig:
+        s = {"sig": sig, "edits": {}, "flags": {}, "version": 0, "handled": None}
+        st.session_state["tab3_edit_state"] = s
+    return s
+
+
+def normalize_raw(df: pd.DataFrame) -> pd.DataFrame:
+    return df.rename(columns=normalize_col_name).reset_index(drop=True).astype(object)
+
+
+def apply_edit_overlay(raw_norm: pd.DataFrame, edits: dict) -> pd.DataFrame:
+    out = raw_norm.copy()
+    for (r, col), val in edits.items():
+        if col not in out.columns:
+            out[col] = None
+        if r in out.index:
+            out.at[r, col] = val
+    return out
+
+
+def _coerce_for_db(val, sa_type, strict=True):
+    """strict=True for new values (bad date raises); strict=False for old values used in WHERE
+    (an unparseable old date was stored as NULL by tab 1, so it matches NULL)."""
+    s = "" if val is None else str(val).strip()
+    if s in _BLANK_VALS:
+        return None
+    if isinstance(sa_type, (sa_types.Date, sa_types.DateTime)):
+        parsed = safe_parse_dates(pd.Series([s])).iloc[0]
+        if pd.isna(parsed):
+            if strict:
+                raise ValueError(f"'{s}' is not a valid date (use YYYY-MM-DD)")
+            return None
+        return parsed
+    return s
+
+
+def update_lab_samples(engine, changes: list):
+    """changes: [{'old': {COL: v}, 'new': {COL: v}}]. One UPDATE per row, in one transaction.
+    Returns number of changes that matched no DB row."""
+    db_cols = {normalize_col_name(c["name"]): c for c in sa_inspect(engine).get_columns("lab_samples")}
+    q = engine.dialect.identifier_preparer.quote
+    unmatched = 0
+    with engine.begin() as conn:
+        for ch in changes:
+            sets, wheres, params = [], [], {}
+            for n, col in enumerate(DB_EDIT_COLS):
+                if col not in db_cols:
+                    continue
+                name, typ = q(db_cols[col]["name"]), db_cols[col]["type"]
+                params[f"o{n}"] = _coerce_for_db(ch["old"].get(col), typ, strict=False)
+                if isinstance(typ, (sa_types.Date, sa_types.DateTime)):
+                    wheres.append(f"{name} IS NOT DISTINCT FROM :o{n}")
+                else:
+                    wheres.append(f"NULLIF(BTRIM(CAST({name} AS TEXT)), '') IS NOT DISTINCT FROM :o{n}")
+                if _disp(ch["old"].get(col)) != _disp(ch["new"].get(col)):
+                    params[f"n{n}"] = _coerce_for_db(ch["new"].get(col), typ)
+                    sets.append(f"{name} = :n{n}")
+            if not sets:
+                continue
+            res = conn.execute(
+                sa_text(f"UPDATE lab_samples SET {', '.join(sets)} WHERE {' AND '.join(wheres)}"), params
+            )
+            if res.rowcount == 0:
+                unmatched += 1
+    return unmatched
+
+
+def save_grid_changes(payload: dict, raw_base: pd.DataFrame, state: dict):
+    """Persists grid edits to Tiger Data and applies flag overrides. Returns (level, message)."""
+    edits = payload.get("edits") or []
+    flag_changes = payload.get("flags") or []
+    by_row = {}
+    for e in edits:
+        by_row.setdefault(int(e["row"]), {})[e["col"]] = str(e["value"]).strip()
+
+    unmatched = 0
+    if by_row:
+        db_uri = os.environ.get("TIGERDATA_URI")
+        if not db_uri:
+            return "error", "TIGERDATA_URI is not set. Nothing was saved."
+        current = apply_edit_overlay(raw_base, state["edits"])
+        changes = []
+        for r, newvals in by_row.items():
+            old = {c: (current.at[r, c] if c in current.columns else None) for c in DB_EDIT_COLS}
+            new = dict(old)
+            new.update(newvals)
+            changes.append({"old": old, "new": new})
+        try:
+            unmatched = update_lab_samples(create_engine(db_uri), changes)
+        except Exception as ex:
+            return "error", f"Save failed, nothing was written: {ex}"
+        for r, newvals in by_row.items():
+            for c, v in newvals.items():
+                state["edits"][(r, c)] = v
+                state["flags"].pop((r, c), None)   # let validation re-decide an edited cell
+
+    # Flag changes are relative to the auto flags AFTER edits
+    if flag_changes:
+        validated = validate_dataframe(apply_edit_overlay(raw_base, state["edits"]))
+        auto = compute_cell_flags(validated)
+        for fc in flag_changes:
+            k = (int(fc["row"]), fc["col"])
+            if bool(fc["flagged"]) == (k in auto):
+                state["flags"].pop(k, None)
+            else:
+                state["flags"][k] = bool(fc["flagged"])
+
+    bits = []
+    if by_row:
+        bits.append(f"{len(edits)} edit(s) saved to Tiger Data")
+    if flag_changes:
+        bits.append(f"{len(flag_changes)} flag change(s) applied")
+    msg = ", ".join(bits) + "."
+    if unmatched:
+        return "warning", msg + f" {unmatched} row(s) not found in lab_samples, so the database was not updated for them."
+    return "success", msg
+
+
+def generate_ai_grease_analysis(client, validated_df: pd.DataFrame) -> str:
+    """Generates deep tribological and grease pattern intelligence using high-level reasoning model."""
+    total_samples = len(validated_df)
+    flagged_count = int(validated_df["IS_FLAGGED"].sum())
+    clean_count = total_samples - flagged_count
+    small_count = int((validated_df["TUBE_SIZE"] == "Small").sum())
+    large_count = int((validated_df["TUBE_SIZE"] == "Large").sum())
+    
+    top_machines = validated_df["MACHINE"].dropna()[~validated_df["MACHINE"].dropna().isin(["", "None", "nan"])].value_counts().head(8).to_dict()
+    top_components = validated_df["COMPONENT"].dropna()[~validated_df["COMPONENT"].dropna().isin(["", "None", "nan"])].value_counts().head(8).to_dict()
+    top_lubes = validated_df["REFERENCE_LUBE"].dropna()[~validated_df["REFERENCE_LUBE"].dropna().isin(["", "None", "nan"])].value_counts().head(8).to_dict()
+    
+    turnaround_series = validated_df["TURNAROUND_DAYS"].dropna()
+    avg_turnaround = round(float(turnaround_series.mean()), 1) if not turnaround_series.empty else "N/A"
+    max_turnaround = int(turnaround_series.max()) if not turnaround_series.empty else "N/A"
+    
+    dup_count = int(validated_df["IS_DUPLICATE"].sum())
+    missing_count = int(validated_df["HAS_MISSING_FIELD"].sum())
+    bad_date_count = int(validated_df["HAS_BAD_DATE"].sum())
+    
+    flagged_rows = validated_df[validated_df["IS_FLAGGED"]].head(25)
+    flagged_summary = []
+    for _, r in flagged_rows.iterrows():
+        flagged_summary.append({
+            "Sample ID": str(r.get("SAMPLE_ID")),
+            "Tube Size": str(r.get("TUBE_SIZE")),
+            "Machine": str(r.get("MACHINE")),
+            "Component": str(r.get("COMPONENT")),
+            "Date Sampled": str(r.get("DATE_SAMPLED")),
+            "Flag Reason": str(r.get("FLAG_REASON"))
+        })
+
+    prompt = f"""You are MRG Laboratories' senior tribologist briefing lab technicians and reliability engineers. They are experts with minutes, not hours. Write for a 10-second glance.
+
+BATCH DATA ({total_samples} grease samples):
+- Quality: {clean_count} clean ({round(clean_count/total_samples*100, 1) if total_samples else 0}%), {flagged_count} flagged ({round(flagged_count/total_samples*100, 1) if total_samples else 0}%)
+- Tubes: Large {large_count}, Small {small_count}
+- Turnaround: avg {avg_turnaround} days, max {max_turnaround} days
+- Flags: duplicate IDs {dup_count}, missing fields {missing_count}, bad dates {bad_date_count}
+- Top machines: {json.dumps(top_machines)}
+- Top components: {json.dumps(top_components)}
+- Reference lubes: {json.dumps(top_lubes)}
+- Flagged records: {json.dumps(flagged_summary)}
+
+LAB RULES:
+- Small tube (RN): needs Sample ID, Date Sampled, Machine, Component (GS/NGS), Serial Number. Reference Lube blank by design.
+- Large tube: needs Sample ID, Machine (Equip ID), Component, Reference Lube. Serial Number blank by design.
+
+OUTPUT FORMAT (follow exactly, nothing before or after):
+
+**Bottom line:** one sentence, max 15 words.
+
+### 🚨 Act now
+2-4 bullets, max 12 words each. Start with the Sample ID, machine, or number. Only items needing action today.
+
+### 📌 Patterns
+Up to 4 bullets, max 12 words each. Format: **Area:** finding + number. Areas: Equipment repeats, Lube mixing risk, Turnaround lag, Label errors. Skip any area with nothing notable.
+
+### ✅ Next steps
+Max 3 numbered actions, max 10 words each. Verb first. Owner in brackets: [Lab] or [Field].
+
+STYLE RULES:
+- Whole answer under 150 words. Shorter is better.
+- Fragments are fine. No intro, outro, hedging, or definitions. Do not restate the data above unless it backs a finding.
+- Bold key numbers and IDs. Numbers beat adjectives.
+- Use only Sample IDs, machines, and figures present in the data above. Never invent. Mark inference with "likely".
+- Nothing notable in a section: write "None." and move on."""
+
+    return call_reasoning_model(client, prompt)
+
+
+def ask_reasoning_chat(client, messages, validated_df: pd.DataFrame) -> str:
+    """Interactive chatbot powered by high-level reasoning model over the current dataset."""
+    total_samples = len(validated_df)
+    flagged_count = int(validated_df["IS_FLAGGED"].sum())
+    
+    top_machines = validated_df["MACHINE"].dropna()[~validated_df["MACHINE"].dropna().isin(["", "None", "nan"])].value_counts().head(10).to_dict()
+    top_comps = validated_df["COMPONENT"].dropna()[~validated_df["COMPONENT"].dropna().isin(["", "None", "nan"])].value_counts().head(10).to_dict()
+    top_lubes = validated_df["REFERENCE_LUBE"].dropna()[~validated_df["REFERENCE_LUBE"].dropna().isin(["", "None", "nan"])].value_counts().head(10).to_dict()
+    tube_dist = validated_df["TUBE_SIZE"].value_counts().to_dict()
+    
+    sample_records = validated_df[["SAMPLE_ID", "TUBE_SIZE", "DATE_SAMPLED", "DATE_RECEIVED", "MACHINE", "COMPONENT", "SERIAL_NUMBER", "REFERENCE_LUBE", "TURNAROUND_DAYS", "IS_FLAGGED", "FLAG_REASON"]].head(150).to_dict(orient="records")
+    
+    context_header = f"""You are the MRG Laboratories Grease Intelligence AI, a high-level reasoning model with deep expertise in tribology, grease analysis, machine lubrication reliability, and laboratory data auditing.
+You are directly analyzing the currently active batch of {total_samples} grease samples ({flagged_count} flagged for data review).
+
+DATASET OVERVIEW:
+- Total Samples: {total_samples}
+- Tube Size Distribution: {json.dumps(tube_dist)}
+- Top Machines: {json.dumps(top_machines)}
+- Top Components: {json.dumps(top_comps)}
+- Reference Lubes: {json.dumps(top_lubes)}
+- Data Rules:
+  * Small tubes (RN): Require Sample ID, Date Sampled, Machine, Component (GS/NGS), Serial Number. Reference Lube is deliberately blank.
+  * Large tubes: Require Sample ID, Machine, Component, Reference Lube. Serial Number is deliberately blank.
+
+RECORDS SAMPLE (First 150 rows):
+{json.dumps(sample_records, default=str)}
+
+RESPONSE STYLE (readers are lab experts with little time):
+- Line 1 is the answer. Max 12 words.
+- Then at most 4 bullets (max 12 words each) OR one compact table (max 6 rows).
+- Under 80 words total, unless the user asks for detail.
+- Fragments are fine. No preamble, no restating the question, no closing offer, no hedging, no definitions of terms experts know.
+- Bold Sample IDs and numbers. Cite IDs, machines, and figures from the data. Never invent. If the data lacks it, say "Not in data."
+- Mark inference with "likely"."""
+
+    conv_lines = []
+    for m in messages:
+        role_label = "User" if m.get("role") == "user" else "Assistant"
+        text_content = ""
+        if isinstance(m.get("content"), list):
+            text_content = " ".join(c.get("text", "") for c in m["content"] if c.get("type") == "text")
+        else:
+            text_content = str(m.get("content", ""))
+        conv_lines.append(f"{role_label}: {text_content}")
+
+    full_prompt = f"{context_header}\n\nCONVERSATION HISTORY:\n" + "\n".join(conv_lines)
+    return call_reasoning_model(client, full_prompt)
+
+
 def get_snowflake_session():
-    """Create a Snowpark session with key-pair auth (same pattern as the original app.py)."""
+    """Create a Snowpark session with key-pair auth."""
     key_path = os.environ.get("SNOWFLAKE_PRIVATE_KEY_PATH", "rsa_key.p8")
     with open(key_path, "rb") as key:
         p_key = serialization.load_pem_private_key(
@@ -194,15 +1314,24 @@ def get_snowflake_session():
     return snowpark.Session.builder.configs(conn_params).create()
 
 
+def normalize_tube_series(tube):
+    """Map tube size aliases; keep unrecognized values so they flag as missing tube size."""
+    if tube is None:
+        return None
+    cleaned = tube.astype(str).str.strip()
+    cleaned = cleaned.mask(cleaned.str.lower().isin(["", "none", "nan", "nat", "<na>"]))
+    return cleaned.str.upper().map(lambda v: TUBE_VALUES.get(v, v) if isinstance(v, str) else v)
+
+
 def ocr_df_to_snowflake_frame(df: pd.DataFrame) -> pd.DataFrame:
     """Map Gemini OCR columns to the Snowflake intake staging schema."""
     sf_df = df.rename(columns=OCR_TO_SF).copy()
     for col in CSV_COLS:
         if col not in sf_df.columns:
             sf_df[col] = None
-    if "TUBE_SIZE" not in sf_df.columns:
-        sf_df["TUBE_SIZE"] = None
-    # Snowflake staging expects strings for OCR fields
+    upper_map = {str(c).strip().upper().replace(" ", "_"): c for c in sf_df.columns}
+    tube_col = next((upper_map[h] for h in TUBE_HEADERS if h in upper_map), None)
+    sf_df["TUBE_SIZE"] = normalize_tube_series(sf_df[tube_col]) if tube_col else None
     for col in CSV_COLS + ["TUBE_SIZE"]:
         sf_df[col] = sf_df[col].astype(str).where(sf_df[col].notna(), None)
         sf_df[col] = sf_df[col].replace({"None": None, "nan": None, "NaT": None})
@@ -212,7 +1341,7 @@ def ocr_df_to_snowflake_frame(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def push_ocr_batch_to_snowflake(df: pd.DataFrame) -> str:
-    """Send the OCR CSV batch into Snowflake STAGING_SAMPLES after Tiger Data."""
+    """Send the OCR CSV batch into Snowflake STAGING_SAMPLES."""
     session = get_snowflake_session()
     try:
         sf_df, batch = ocr_df_to_snowflake_frame(df)
@@ -232,109 +1361,12 @@ def push_ocr_batch_to_snowflake(df: pd.DataFrame) -> str:
         session.close()
 
 
-def build_batch_qc_stats(df: pd.DataFrame) -> dict:
-    """Lightweight batch stats sent to Grok for automated QC (no raw images)."""
-    work = df.copy()
-    for col in [
-        "Sample ID", "Date Sampled", "Date Received",
-        "Machine", "Component", "Serial Number", "Reference Lube",
-    ]:
-        if col not in work.columns:
-            work[col] = None
-
-    sample_ids = work["Sample ID"].astype(str)
-    missing_sample_id = int(((sample_ids == "") | sample_ids.isna() | (sample_ids == "nan") | (sample_ids == "ERROR")).sum())
-    dup_ids = sample_ids[sample_ids.duplicated(keep=False) & ~sample_ids.isin(["", "nan", "ERROR", "None"])]
-    missing_fields = {
-        col: int(work[col].isna().sum() + (work[col].astype(str).str.strip() == "").sum())
-        for col in ["Date Sampled", "Machine", "Component", "Serial Number", "Reference Lube"]
-    }
-    failed = int(work.get("Status", pd.Series(dtype=str)).astype(str).str.startswith("Failed").sum()) if "Status" in work.columns else 0
-
-    preview_cols = [c for c in [
-        "Sample ID", "Date Sampled", "Date Received", "Machine", "Component",
-        "Serial Number", "Reference Lube",
-    ] if c in work.columns]
-    preview = work[preview_cols].head(15).fillna("").astype(str).to_dict(orient="records")
-
-    return {
-        "row_count": int(len(work)),
-        "failed_ocr_rows": failed,
-        "missing_or_error_sample_ids": missing_sample_id,
-        "duplicate_sample_id_count": int(dup_ids.nunique()),
-        "duplicate_sample_ids": sorted(dup_ids.dropna().astype(str).unique().tolist())[:20],
-        "missing_field_counts": missing_fields,
-        "preview_rows": preview,
-    }
-
-
-def run_grok_batch_qc(df: pd.DataFrame, batch_id: str | None = None) -> str:
-    """
-    Auto QC via xAI Grok chat completions.
-    XAI_API_KEY authenticates to https://api.x.ai/v1/chat/completions so Grok can
-    review batch stats and return a short readiness report.
-    """
-    if not XAI_API_KEY:
-        raise RuntimeError(
-            "XAI_API_KEY (or GROK_API_KEY) is not set — cannot run Grok automation."
-        )
-
-    stats = build_batch_qc_stats(df)
-    system = (
-        "You are Grok, the automated QC reviewer for MRG Laboratories sample intake. "
-        "Given batch statistics from OCR → Tiger Data → Snowflake, produce a concise "
-        "ops report. Flag missing entries, duplicate Sample IDs, and OCR failures. "
-        "End with a clear READY TO SUBMIT or NEEDS REVIEW decision and 2-4 bullet actions."
-    )
-    user = (
-        f"Batch ID: {batch_id or 'UNKNOWN'}\n"
-        f"Pipeline: Gemini OCR → Tiger Data → Snowflake STAGING_SAMPLES\n"
-        f"Stats JSON:\n{json.dumps(stats, default=str)}"
-    )
-
-    resp = requests.post(
-        "https://api.x.ai/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {XAI_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": GROK_MODEL,
-            "temperature": 0.2,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        },
-        timeout=60,
-    )
-    if resp.status_code >= 400:
-        raise RuntimeError(f"Grok API error {resp.status_code}: {resp.text[:500]}")
-
-    body = resp.json()
-    report = body["choices"][0]["message"]["content"].strip()
-
-    # Persist evidence for SpaceXSI / hackathon documentation
-    stamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(GROK_QC_LOG, "a", encoding="utf-8") as log:
-        log.write(
-            f"\n## Grok QC — {stamp}\n"
-            f"- Model: `{GROK_MODEL}`\n"
-            f"- Batch: `{batch_id or 'UNKNOWN'}`\n"
-            f"- Rows: {stats['row_count']}\n"
-            f"- Duplicates: {stats['duplicate_sample_id_count']}\n"
-            f"- Missing/error Sample IDs: {stats['missing_or_error_sample_ids']}\n\n"
-            f"{report}\n\n---\n"
-        )
-    return report
-
-
 def sf_query(session, sql: str, params=None) -> pd.DataFrame:
     return session.sql(sql, params=params).to_pandas()
 
 
 def ask_analyst(session, messages):
-    """Cortex Analyst over the MRG intake semantic view (from Sample Intake)."""
+    """Cortex Analyst over the MRG intake semantic view (Sample Intake / app2)."""
     payload = {"messages": messages, "semantic_view": SEMANTIC_VIEW}
     if _snowflake is not None:
         resp = _snowflake.send_snow_api_request(
@@ -351,9 +1383,7 @@ def ask_analyst(session, messages):
             }
             host = os.environ.get("SNOWFLAKE_HOST") or session.connection.host
         else:
-            headers = {
-                "Authorization": f'Snowflake Token="{session.connection.rest.token}"'
-            }
+            headers = {"Authorization": f'Snowflake Token="{session.connection.rest.token}"'}
             host = session.connection.host
         r = requests.post(
             f"https://{host}/api/v2/cortex/analyst/message",
@@ -367,6 +1397,141 @@ def ask_analyst(session, messages):
     return body["message"]
 
 
+def build_batch_qc_stats(df: pd.DataFrame) -> dict:
+    """Lightweight batch stats sent to Grok for automated QC (no raw images)."""
+    work = df.copy()
+    for col in [
+        "Sample ID", "Date Sampled", "Date Received",
+        "Machine", "Component", "Serial Number", "Reference Lube", "Tube Size",
+    ]:
+        if col not in work.columns:
+            work[col] = None
+    sample_ids = work["Sample ID"].astype(str)
+    missing_sample_id = int(
+        ((sample_ids == "") | sample_ids.isna() | (sample_ids == "nan") | (sample_ids == "ERROR")).sum()
+    )
+    dup_ids = sample_ids[sample_ids.duplicated(keep=False) & ~sample_ids.isin(["", "nan", "ERROR", "None"])]
+    missing_fields = {
+        col: int(work[col].isna().sum() + (work[col].astype(str).str.strip() == "").sum())
+        for col in ["Date Sampled", "Machine", "Component", "Serial Number", "Reference Lube", "Tube Size"]
+    }
+    preview_cols = [c for c in [
+        "Sample ID", "Tube Size", "Date Sampled", "Date Received", "Machine",
+        "Component", "Serial Number", "Reference Lube",
+    ] if c in work.columns]
+    return {
+        "row_count": int(len(work)),
+        "missing_or_error_sample_ids": missing_sample_id,
+        "duplicate_sample_id_count": int(dup_ids.nunique()),
+        "duplicate_sample_ids": sorted(dup_ids.dropna().astype(str).unique().tolist())[:20],
+        "missing_field_counts": missing_fields,
+        "preview_rows": work[preview_cols].head(15).fillna("").astype(str).to_dict(orient="records"),
+    }
+
+
+def run_grok_batch_qc(df: pd.DataFrame, batch_id: str | None = None) -> str:
+    """Auto QC via xAI Grok. XAI_API_KEY authenticates the chat completions call."""
+    if not XAI_API_KEY:
+        raise RuntimeError("XAI_API_KEY (or GROK_API_KEY) is not set — cannot run Grok automation.")
+    stats = build_batch_qc_stats(df)
+    resp = requests.post(
+        "https://api.x.ai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"},
+        json={
+            "model": GROK_MODEL,
+            "temperature": 0.2,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Grok, the automated QC reviewer for MRG Laboratories sample intake. "
+                        "Given batch statistics from OCR → Tiger Data → Snowflake, produce a concise ops report. "
+                        "Flag missing entries, duplicate Sample IDs, and tube-size issues. "
+                        "End with READY TO SUBMIT or NEEDS REVIEW and 2-4 bullet actions."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Batch ID: {batch_id or 'UNKNOWN'}\n"
+                        f"Stats JSON:\n{json.dumps(stats, default=str)}"
+                    ),
+                },
+            ],
+        },
+        timeout=60,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Grok API error {resp.status_code}: {resp.text[:500]}")
+    report = resp.json()["choices"][0]["message"]["content"].strip()
+    stamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(GROK_QC_LOG, "a", encoding="utf-8") as log:
+        log.write(
+            f"\n## Grok QC — {stamp}\n"
+            f"- Model: `{GROK_MODEL}`\n"
+            f"- Batch: `{batch_id or 'UNKNOWN'}`\n"
+            f"- Rows: {stats['row_count']}\n\n{report}\n\n---\n"
+        )
+    return report
+
+
+def anchor_to_solana(extracted_data):
+    """Anchors the sample metadata to Solana Devnet via SPL Memo."""
+    async def _send_tx():
+        solana_client = AsyncClient("https://api.devnet.solana.com")
+        try:
+            secret_key_string = os.environ.get("SOLANA_SECRET_KEY")
+            if not secret_key_string:
+                return "No Solana Wallet Configured"
+            
+            if secret_key_string.strip().startswith('['):
+                try:
+                    key_bytes = bytes(json.loads(secret_key_string))
+                    wallet = Keypair.from_bytes(key_bytes)
+                except Exception as e:
+                    return f"Solana TX Failed: Invalid JSON key format - {str(e)}"
+            else:
+                try:
+                    wallet = Keypair.from_base58_string(secret_key_string)
+                except Exception as e:
+                    return f"Solana TX Failed: Invalid Base58 key format - {str(e)}"
+            
+            memo_program_id = Pubkey.from_string("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr")
+            
+            memo_str = (f"MRG-LAB-ATTEST:{extracted_data.get('Sample ID', 'N/A')}|"
+                        f"MACH:{extracted_data.get('Machine', 'N/A')}|"
+                        f"DATE:{extracted_data.get('Date Sampled', 'N/A')}")
+            
+            memo_ix = Instruction(
+                program_id=memo_program_id,
+                accounts=[], 
+                data=memo_str.encode('utf-8')
+            )
+            
+            blockhash_resp = await solana_client.get_latest_blockhash()
+            latest_blockhash = blockhash_resp.value.blockhash
+            
+            msg = MessageV0.try_compile(
+                payer=wallet.pubkey(),
+                instructions=[memo_ix],
+                address_lookup_table_accounts=[],
+                recent_blockhash=latest_blockhash
+            )
+            
+            tx = VersionedTransaction(msg, [wallet])
+            signature_resp = await solana_client.send_transaction(tx)
+            return f"https://explorer.solana.com/tx/{signature_resp.value}?cluster=devnet"
+        except Exception as e:
+            return f"Solana TX Failed: {str(e)}"
+        finally:
+            await solana_client.close()
+
+    try:
+        return asyncio.run(_send_tx())
+    except Exception as e:
+        return f"Solana Execution Failed: {str(e)}"
+
+
 def process_label(client, uploaded_file):
     try:
         image = Image.open(uploaded_file)
@@ -378,6 +1543,7 @@ def process_label(client, uploaded_file):
 
         Extract the data to match these exact rules:
         If Large:
+        - Tube Size: Large
         - Sample ID: Barcode or num
         - Date Sampled: Extract the date written (leave blank if empty)
         - Machine: Equip ID
@@ -386,6 +1552,7 @@ def process_label(client, uploaded_file):
         - Reference Lube: Ref Lube
 
         If Small:
+        - Tube Size: Small
         - Sample ID: Barcode or num
         - Date Sampled: Extract the date written
         - Machine: RN
@@ -394,7 +1561,7 @@ def process_label(client, uploaded_file):
         - Reference Lube: (leave blank)
 
         Return ONLY a raw JSON object (no markdown formatting, no backticks) with exactly these keys:
-        "Sample ID", "Date Sampled", "Machine", "Component", "Serial Number", "Reference Lube"
+        "Tube Size", "Sample ID", "Date Sampled", "Machine", "Component", "Serial Number", "Reference Lube"
         """
 
         max_retries = 3
@@ -403,7 +1570,7 @@ def process_label(client, uploaded_file):
         for attempt in range(max_retries):
             try:
                 response = client.models.generate_content(
-                    model='gemini-3.8-flash',
+                    model='gemini-3.7-flash',
                     contents=[prompt, image]
                 )
                 break
@@ -418,8 +1585,13 @@ def process_label(client, uploaded_file):
 
         extracted_data["Filename"] = uploaded_file.name
         extracted_data["Date Received"] = date.today().strftime("%m/%d/%Y")
+        
+        # --- SOLANA INTEGRATION ---
+        solana_explorer_url = anchor_to_solana(extracted_data)
+        extracted_data["Solana Audit Trail"] = solana_explorer_url
+        # --------------------------
+        
         extracted_data["Status"] = "Success"
-
         return extracted_data
 
     except Exception as e:
@@ -430,7 +1602,9 @@ def process_label(client, uploaded_file):
         }
 
 
-tab1, tab2, tab3 = st.tabs(["Image Upload", "Data Viewer", "Snowflake Intake"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "Image Upload", "Data Viewer", "Grease Intelligence", "Snowflake Intake",
+])
 
 with tab1:
     col_text, col_btn = st.columns([3, 1])
@@ -472,11 +1646,15 @@ with tab1:
                     status_text.text(f"Processed {i + 1} of {len(uploaded_files)} labels...")
 
             columns = [
-                "Sample ID", "Date Sampled", "Date Received",
+                "Sample ID", "Tube Size", "Date Sampled", "Date Received",
                 "Machine", "Component", "Serial Number", "Reference Lube",
+                "Solana Audit Trail"
             ]
 
             df = pd.DataFrame(results)
+            for c in columns:
+                if c not in df.columns:
+                    df[c] = None
             df = df.reindex(columns=columns)
 
             df['Date Sampled'] = pd.to_datetime(df['Date Sampled'], errors='coerce').dt.date
@@ -486,7 +1664,9 @@ with tab1:
             if db_uri:
                 try:
                     engine = create_engine(db_uri)
-                    df.to_sql('lab_samples', con=engine, if_exists='append', index=False)
+                    # Drop non-standard columns so it matches the SQL database schema
+                    db_df = df.drop(columns=["Solana Audit Trail", "Tube Size", "TUBE_SIZE"], errors='ignore')
+                    db_df.to_sql('lab_samples', con=engine, if_exists='append', index=False)
                     st.toast("Wrote batch to Tiger Data")
                 except Exception as e:
                     st.error(f"Failed to write to Tiger Data: {e}")
@@ -502,7 +1682,7 @@ with tab1:
             except Exception as e:
                 st.error(f"Failed to write to Snowflake: {e}")
 
-            # 3) Auto-run Grok QC automation on the finished batch
+            # 3) Auto-run Grok QC after Tiger Data + Snowflake
             st.session_state.grok_qc_report = None
             st.session_state.grok_qc_error = None
             try:
@@ -517,16 +1697,8 @@ with tab1:
             st.session_state.generated_csv = df.to_csv(index=False).encode('utf-8')
             st.session_state.csv_filename = f"{user_file_name}.csv"
 
-            st.session_state.uploader_key += 1
-            st.rerun()
-
+    # Tab 1: Popups removed; displays dataframe and download button directly
     if st.session_state.generated_csv is not None:
-        st.success("All labels processed successfully! The upload area has been cleared for your next batch.")
-        if st.session_state.last_snowflake_batch:
-            st.info(
-                f"Latest Snowflake batch: `{st.session_state.last_snowflake_batch}` "
-                "— open the **Snowflake Intake** tab to review / chat."
-            )
         st.dataframe(st.session_state.processed_df)
 
         st.download_button(
@@ -535,18 +1707,13 @@ with tab1:
             file_name=st.session_state.csv_filename,
             mime="text/csv",
         )
-
-        # Grok automation output (auto-run after each Process All Labels)
-        st.markdown("#### 🤖 Grok Automation — Batch QC")
+        st.markdown("#### Grok Automation — Batch QC")
         if st.session_state.grok_qc_report:
             st.success("Grok auto-reviewed this batch after Tiger Data + Snowflake sync.")
             st.markdown(st.session_state.grok_qc_report)
             st.caption(f"Logged to `{GROK_QC_LOG}` · model `{GROK_MODEL}`")
         elif st.session_state.grok_qc_error:
             st.error(f"Grok QC error: {st.session_state.grok_qc_error}")
-            st.caption("Set `XAI_API_KEY` in the environment, then re-process a batch.")
-        else:
-            st.info("Grok QC will auto-run the next time you process labels.")
 
     # --- MINESWEEPER COMPONENT ---
     st.markdown("---")
@@ -712,299 +1879,796 @@ with tab2:
             engine = create_engine(db_uri)
             db_df = pd.read_sql_table('lab_samples', con=engine)
 
-            st.markdown("##### Filter Data")
-            filter_col1, filter_col2 = st.columns(2)
-            with filter_col1:
-                machine_filter = st.text_input("Filter by Machine (leave blank for all)")
-            with filter_col2:
-                available_components = db_df['Component'].dropna().unique().tolist()
-                comp_filter = st.multiselect("Filter by Component", options=available_components)
-
             filtered_df = db_df.copy()
-            if machine_filter:
-                filtered_df = filtered_df[filtered_df['Machine'].astype(str).str.contains(machine_filter, case=False, na=False)]
-            if comp_filter:
-                filtered_df = filtered_df[filtered_df['Component'].isin(comp_filter)]
+            
+            # Action Row: Filter Options, Clear Button, and Right-Aligned Export Popover
+            col_filter, col_clear, col_gap, col_export = st.columns([1.8, 1.2, 5.0, 2.0])
+            with col_filter:
+                with st.popover("⚙️ Filter Data Options"):
+                    for col in db_df.columns:
+                        col_norm = col.strip().lower().replace(" ", "_")
+                        
+                        # Date selector for Date Sampled and Date Received
+                        if col_norm in ["date_sampled", "date_received"]:
+                            date_val = st.date_input(
+                                f"Filter by {col}",
+                                value=(),
+                                key=f"filter_date_{col}",
+                                help="Select one date for exact match, or click two dates to select a range"
+                            )
+                            if date_val:
+                                col_dates = safe_parse_dates(filtered_df[col])
+                                if isinstance(date_val, (tuple, list)):
+                                    if len(date_val) == 1:
+                                        d_single = date_val[0]
+                                        if d_single:
+                                            filtered_df = filtered_df[col_dates == d_single]
+                                    elif len(date_val) >= 2:
+                                        d_start, d_end = date_val[0], date_val[1]
+                                        if d_start and d_end:
+                                            if d_start > d_end:
+                                                d_start, d_end = d_end, d_start
+                                            filtered_df = filtered_df[(col_dates >= d_start) & (col_dates <= d_end)]
+                                elif isinstance(date_val, (date, datetime)):
+                                    d_single = date_val if isinstance(date_val, date) else date_val.date()
+                                    filtered_df = filtered_df[col_dates == d_single]
+                        else:
+                            # Standard categorical multiselect or text search
+                            unique_vals = db_df[col].dropna().unique().tolist()
+                            if len(unique_vals) <= 40:
+                                selected = st.multiselect(f"Filter by {col}", options=unique_vals, key=f"filter_{col}")
+                                if selected:
+                                    filtered_df = filtered_df[filtered_df[col].isin(selected)]
+                            else:
+                                text_search = st.text_input(f"Search {col}", key=f"filter_{col}")
+                                if text_search:
+                                    filtered_df = filtered_df[filtered_df[col].astype(str).str.contains(text_search, case=False, na=False)]
+            
+            with col_clear:
+                if st.button("Clear Filters"):
+                    for key in list(st.session_state.keys()):
+                        if key.startswith("filter_"):
+                            del st.session_state[key]
+                    st.rerun()
 
-            st.dataframe(filtered_df.tail(100), use_container_width=True)
+            with col_export:
+                with st.popover("📥 Export Data", use_container_width=True):
+                    st.markdown(f"**Export Visible Samples**<br><small>{len(filtered_df)} record(s) matching current filters.</small>", unsafe_allow_html=True)
+                    
+                    # CSV Export
+                    csv_bytes = filtered_df.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        label="📄 Export as CSV",
+                        data=csv_bytes,
+                        file_name="visible_lab_samples.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+                    
+                    # JSON Export
+                    json_bytes = filtered_df.to_json(orient='records', indent=2).encode('utf-8')
+                    st.download_button(
+                        label="📋 Export as JSON",
+                        data=json_bytes,
+                        file_name="visible_lab_samples.json",
+                        mime="application/json",
+                        use_container_width=True
+                    )
+                    
+                    # Excel Export
+                    excel_bytes = df_to_excel_bytes(filtered_df)
+                    st.download_button(
+                        label="📊 Export as Excel (.xlsx)",
+                        data=excel_bytes,
+                        file_name="visible_lab_samples.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
+                    
+                    # PDF Export
+                    pdf_bytes = df_to_pdf_bytes(filtered_df, title="MRG Labs - Visible Samples")
+                    st.download_button(
+                        label="📑 Export as PDF",
+                        data=pdf_bytes,
+                        file_name="visible_lab_samples.pdf",
+                        mime="application/pdf",
+                        use_container_width=True
+                    )
 
-            st.divider()
-            st.caption(
-                "For Snowflake Cortex Analyst chat (copied / missing entries, duplicates, turnaround), "
-                "use the **Snowflake Intake** tab."
-            )
-            if st.button("Sync filtered Tiger rows to Snowflake now", use_container_width=True):
-                try:
-                    # Align Tiger column names to OCR frame shape expected by the mapper
-                    sync_df = filtered_df.rename(columns={c: c for c in filtered_df.columns})
-                    needed = list(OCR_TO_SF.keys())
-                    for col in needed:
-                        if col not in sync_df.columns:
-                            sync_df[col] = None
-                    batch_id = push_ocr_batch_to_snowflake(sync_df[needed])
-                    st.session_state.last_snowflake_batch = batch_id
-                    st.success(f"Synced {len(sync_df)} rows to Snowflake as `{batch_id}`")
-                except Exception as e:
-                    st.error(f"Snowflake sync failed: {e}")
+            st.caption(f"Showing **{len(filtered_df)}** of **{len(db_df)}** total records from database.")
+            st.dataframe(filtered_df, use_container_width=True)
+
         else:
             st.warning("TIGERDATA_URI environment variable is not set.")
     except Exception as e:
         st.error(f"Could not connect to database: {e}")
 
-# ---------- Snowflake Sample Intake (dashboard + Cortex Analyst chatbot) ----------
+# ---------- Grease intelligence (local CSV / OCR analysis) ----------
 with tab3:
-    st.subheader("MRG Laboratories — Sample Intake")
-    st.caption(
-        "Review batches synced from OCR → Tiger Data → Snowflake. "
-        "Ask Cortex Analyst about copied datasets, missing fields, duplicates, and turnaround."
-    )
+    st.subheader("MRG Laboratories — Grease Sample Intake & Intelligence")
+    st.caption("Live Snowflake batches, Cortex Analyst, and Submit to MRG are on the **Snowflake Intake** tab.")
 
+    # CSV File Upload Field (Analysis is performed on this uploaded CSV)
+    col_csv, col_tab1_ref = st.columns([3, 1])
+    with col_csv:
+        uploaded_csv_file = st.file_uploader(
+            "Upload Lab Samples CSV for Analysis",
+            type=["csv"],
+            key="sf_csv_upload",
+            help="Upload the weekly OCR output or intake CSV to run deep analysis"
+        )
+    with col_tab1_ref:
+        if st.session_state.processed_df is not None:
+            st.write("")
+            st.write("")
+            if st.button("📂 Load Tab 1 OCR Batch", use_container_width=True):
+                st.session_state.use_tab1_in_tab3 = True
+                st.rerun()
+
+    raw_data = None
+    data_source_name = ""
+
+    if uploaded_csv_file is not None:
+        try:
+            raw_data = pd.read_csv(uploaded_csv_file, dtype=str)
+            data_source_name = f"Uploaded CSV: {uploaded_csv_file.name}"
+        except Exception as e:
+            st.error(f"Failed to read uploaded CSV file: {e}")
+    elif st.session_state.get('use_tab1_in_tab3', False) and st.session_state.processed_df is not None:
+        raw_data = st.session_state.processed_df.copy()
+        data_source_name = f"Recent Tab 1 OCR Batch ({len(raw_data)} samples)"
+    elif st.session_state.processed_df is not None:
+        raw_data = st.session_state.processed_df.copy()
+        data_source_name = f"Tab 1 Batch ({len(raw_data)} samples)"
+
+    if raw_data is None or raw_data.empty:
+        st.info("Please upload a lab samples CSV above (or process labels in Tab 1) to inspect grease intake trends and run AI data intelligence.")
+    else:
+        # Validate data with strict differentiation between Small and Large tube sizes
+        raw_sig = tab3_signature(raw_data)
+        edit_state = get_tab3_state(raw_sig)
+        raw_base = normalize_raw(raw_data)
+        data = validate_dataframe(apply_edit_overlay(raw_base, edit_state["edits"]))
+        data, cell_flags = apply_flag_overrides(data, edit_state["flags"])
+        
+        # Optional sync to Snowflake Staging
+        with st.expander("❄️ Optional: Sync CSV to Snowflake Intake"):
+            col_push, col_push_info = st.columns([1, 2])
+            with col_push:
+                if st.button("Push Batch to Snowflake", key="sf_sync_push_btn"):
+                    try:
+                        synced_batch = push_ocr_batch_to_snowflake(data)
+                        st.session_state.last_snowflake_batch = synced_batch
+                        st.success(f"Synced {len(data)} samples into Snowflake batch: `{synced_batch}`")
+                    except Exception as sf_err:
+                        st.error(f"Snowflake sync error: {sf_err}")
+            with col_push_info:
+                if st.session_state.last_snowflake_batch:
+                    st.caption(f"Latest batch ID: `{st.session_state.last_snowflake_batch}`")
+
+        # 3 Sub-tabs (Flagged samples sub-tab removed)
+        tab_dash, tab_chat, tab_data = st.tabs(
+            ["Dashboard", "Ask the data", "Data"]
+        )
+
+        with tab_dash:
+            # Minimalist Bento Box SaaS Layout
+            total_n = len(data)
+            flagged_n = int(data["IS_FLAGGED"].sum())
+            clean_n = total_n - flagged_n
+            quality_score = round((clean_n / total_n * 100), 1) if total_n > 0 else 0
+            
+            small_n = int((data["TUBE_SIZE"] == "Small").sum())
+            large_n = int((data["TUBE_SIZE"] == "Large").sum())
+            small_pct = round(small_n / total_n * 100, 1) if total_n > 0 else 0
+            large_pct = round(large_n / total_n * 100, 1) if total_n > 0 else 0
+            
+            t_days = data["TURNAROUND_DAYS"].dropna()
+            avg_turnaround = round(float(t_days.mean()), 1) if len(t_days) > 0 else 0
+            
+            mach_series = data["MACHINE"].dropna()
+            mach_series = mach_series[~mach_series.isin(["", "None", "nan", "NaT", "<NA>"])]
+            unique_machines = mach_series.nunique()
+            
+            comp_series = data["COMPONENT"].dropna()
+            comp_series = comp_series[~comp_series.isin(["", "None", "nan", "NaT", "<NA>"])]
+            unique_components = comp_series.nunique()
+
+            # Bento KPI Cards Row
+            k1, k2, k3, k4, k5 = st.columns(5)
+            with k1:
+                st.markdown(f"""
+                    <div class="bento-card">
+                        <div class="bento-header">
+                            <span class="bento-title">Total Samples</span>
+                            <span class="bento-badge bento-badge-info">Intake</span>
+                        </div>
+                        <div class="bento-metric">{total_n}</div>
+                        <div class="bento-subtitle">{data_source_name}</div>
+                    </div>
+                """, unsafe_allow_html=True)
+            with k2:
+                q_badge = "bento-badge-success" if quality_score >= 90 else "bento-badge-warning"
+                st.markdown(f"""
+                    <div class="bento-card">
+                        <div class="bento-header">
+                            <span class="bento-title">Quality & Compliance</span>
+                            <span class="bento-badge {q_badge}">{quality_score}% Clean</span>
+                        </div>
+                        <div class="bento-metric">{flagged_n} <span style="font-size: 14px; font-weight: 500; color: #64748b;">flagged</span></div>
+                        <div class="bento-subtitle">{clean_n} verified records</div>
+                    </div>
+                """, unsafe_allow_html=True)
+            with k3:
+                st.markdown(f"""
+                    <div class="bento-card">
+                        <div class="bento-header">
+                            <span class="bento-title">Tube Size Split</span>
+                            <span class="bento-badge bento-badge-info">Grease Thief</span>
+                        </div>
+                        <div class="bento-metric">{large_n}L / {small_n}S</div>
+                        <div class="bento-subtitle">{large_pct}% Large • {small_pct}% Small</div>
+                    </div>
+                """, unsafe_allow_html=True)
+            with k4:
+                t_badge = "bento-badge-success" if avg_turnaround <= 7 else "bento-badge-warning"
+                st.markdown(f"""
+                    <div class="bento-card">
+                        <div class="bento-header">
+                            <span class="bento-title">Avg Turnaround</span>
+                            <span class="bento-badge {t_badge}">{avg_turnaround} d</span>
+                        </div>
+                        <div class="bento-metric">{avg_turnaround} <span style="font-size: 14px; font-weight: 500; color: #64748b;">days</span></div>
+                        <div class="bento-subtitle">Field draw to lab intake</div>
+                    </div>
+                """, unsafe_allow_html=True)
+            with k5:
+                st.markdown(f"""
+                    <div class="bento-card">
+                        <div class="bento-header">
+                            <span class="bento-title">Monitored Assets</span>
+                            <span class="bento-badge bento-badge-info">Assets</span>
+                        </div>
+                        <div class="bento-metric">{unique_machines}</div>
+                        <div class="bento-subtitle">{unique_components} distinct sample points</div>
+                    </div>
+                """, unsafe_allow_html=True)
+
+            st.write("")
+
+            # Bento Grid Visualizations (Row 1)
+            r1_c1, r1_c2 = st.columns(2)
+            with r1_c1:
+                with st.container(border=True):
+                    st.markdown("##### 📈 Sample Intake & Collection Velocity")
+                    st.caption("Distribution of grease samples across received and sampled dates")
+                    date_col = "DATE_RECEIVED" if "DATE_RECEIVED" in data.columns else "DATE_SAMPLED"
+                    date_counts = data[date_col].dropna().value_counts().sort_index()
+                    if not date_counts.empty:
+                        st.bar_chart(date_counts.rename("Samples"), color="#004B87")
+                    else:
+                        st.info("No date records available to plot.")
+
+            with r1_c2:
+                with st.container(border=True):
+                    st.markdown("##### ⚙️ High-Frequency Assets (Repeat Sampling Trend)")
+                    st.caption("Top machines by sample count — assets with frequent grease draws")
+                    if not mach_series.empty:
+                        top_mach = mach_series.value_counts().head(8)
+                        st.bar_chart(top_mach.rename("Samples"), color="#005A9E")
+                    else:
+                        st.info("No machine records available to plot.")
+
+            # Bento Grid Visualizations (Row 2)
+            r2_c1, r2_c2 = st.columns(2)
+            with r2_c1:
+                with st.container(border=True):
+                    st.markdown("##### 📍 Component & Sample Point Distribution")
+                    st.caption("Breakdown across bearings, gearboxes, and GS/NGS points")
+                    if not comp_series.empty:
+                        top_comp = comp_series.value_counts().head(8)
+                        st.bar_chart(top_comp.rename("Samples"), color="#0284C7")
+                    else:
+                        st.info("No component records available to plot.")
+
+            with r2_c2:
+                with st.container(border=True):
+                    st.markdown("##### 🧴 Reference Lubricants & Consolidation")
+                    st.caption("Primary grease formulations registered across machinery")
+                    lube_series = data["REFERENCE_LUBE"].dropna()
+                    lube_series = lube_series[~lube_series.isin(["", "None", "nan", "NaT", "<NA>"])]
+                    if not lube_series.empty:
+                        top_lubes = lube_series.value_counts().head(8)
+                        st.bar_chart(top_lubes.rename("Samples"), color="#4F46E5")
+                    else:
+                        st.caption("Reference Lubes are recorded on Large sample tubes (omitted on Small RN tubes).")
+                        st.info("No reference lubes recorded in this batch.")
+
+            # Bento Grid Visualizations (Row 3: Transit Latency & Quality Integrity)
+            r3_c1, r3_c2 = st.columns(2)
+            with r3_c1:
+                with st.container(border=True):
+                    st.markdown("##### ⏱️ Transit Latency & Turnaround Distribution")
+                    st.caption("Delay from sampling to lab receipt (identifies shelf-life / transit lag)")
+                    def bucket_turnaround(d):
+                        if pd.isna(d) or d is None:
+                            return "Unknown / Bad Date"
+                        d_val = int(d)
+                        if d_val <= 3:
+                            return "0-3 Days (Optimal)"
+                        elif d_val <= 7:
+                            return "4-7 Days (Standard)"
+                        elif d_val <= 14:
+                            return "8-14 Days (Delayed)"
+                        else:
+                            return "15+ Days (High Latency)"
+                    b_counts = data["TURNAROUND_DAYS"].apply(bucket_turnaround).value_counts()
+                    st.bar_chart(b_counts.rename("Samples"), color="#E11D48")
+
+            with r3_c2:
+                with st.container(border=True):
+                    st.markdown("##### 🛡️ Data Quality & Audit Categorization")
+                    st.caption("Audit classification of sample anomalies in this batch")
+                    audit_cats = {
+                        "Clean Records": clean_n,
+                        "Duplicate IDs": int(data["IS_DUPLICATE"].sum()),
+                        "Missing Universal": int((data["HAS_MISSING_FIELD"] & data["MISSING_REASONS"].str.contains("Sample ID|Machine|Component", na=False)).sum()),
+                        "Missing Small-Specific": int((data["HAS_MISSING_FIELD"] & (data["TUBE_SIZE"] == "Small") & data["MISSING_REASONS"].str.contains("Date Sampled|Serial Number", na=False)).sum()),
+                        "Missing Large-Specific": int((data["HAS_MISSING_FIELD"] & (data["TUBE_SIZE"] == "Large") & data["MISSING_REASONS"].str.contains("Reference Lube", na=False)).sum()),
+                        "Bad / Inverted Dates": int(data["HAS_BAD_DATE"].sum())
+                    }
+                    st.bar_chart(pd.Series(audit_cats).rename("Samples"), color="#F59E0B")
+
+            # High-Level Reasoning AI Intelligence Tile
+            st.markdown("""
+                <div class="bento-ai-container">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <div>
+                            <h4 style="margin: 0; color: #004B87; font-size: 17px;">🧠 AI Tribology Intelligence & Pattern Detection</h4>
+                            <p style="margin: 4px 0 0 0; color: #475569; font-size: 13px;">High-level reasoning model analysis of equipment distress clusters, lubricant cross-mixing, and transit aging risks.</p>
+                        </div>
+                    </div>
+                </div>
+            """, unsafe_allow_html=True)
+
+            col_run_ai, col_clear_ai = st.columns([2, 8])
+            with col_run_ai:
+                if st.button("⚡ Run AI Pattern Analysis", key="btn_run_deep_ai"):
+                    client = genai.Client(api_key=api_key)
+                    with st.spinner("Analyzing grease sample patterns with high-level reasoning model..."):
+                        try:
+                            analysis_result = generate_ai_grease_analysis(client, data)
+                            st.session_state.ai_grease_analysis = analysis_result
+                        except Exception as ai_err:
+                            st.error(f"Reasoning model error: {ai_err}")
+
+            if st.session_state.ai_grease_analysis:
+                with st.container(border=True):
+                    st.markdown(st.session_state.ai_grease_analysis)
+
+        with tab_chat:
+            st.markdown("##### 💬 Ask the Data — High-Level Reasoning Intelligence")
+            st.caption(
+                "Ask complex questions regarding repeat machine sampling, grease degradation risks, "
+                "lubrication consistency, turnaround latency, and label anomalies."
+            )
+
+            # Quick Prompt Chips
+            c_q1, c_q2, c_q3 = st.columns(3)
+            quick_prompt = None
+            with c_q1:
+                if st.button("🔍 Problem Equipment Clusters", use_container_width=True, key="chip_prob_mach"):
+                    quick_prompt = "Top 5 machines by sample count. Likely wear problem? One line each."
+            with c_q2:
+                if st.button("⚠️ Flagged Sample Audit", use_container_width=True, key="chip_flagged_audit"):
+                    quick_prompt = "List flagged samples as: ID, issue, fix. Group by Small and Large tubes."
+            with c_q3:
+                if st.button("⏱️ Turnaround Latency Analysis", use_container_width=True, key="chip_latency"):
+                    quick_prompt = "Top 5 longest turnarounds: ID, machine, days. Integrity risk?"
+
+            # Render message history
+            for m in st.session_state.msgs:
+                role = m.get("role", "user")
+                content = m.get("content", "")
+                with st.chat_message(role):
+                    st.markdown(content)
+
+            chat_input_val = st.chat_input("Ask Cortex/Gemini about this intake data…")
+            prompt_to_send = quick_prompt or chat_input_val
+
+            if prompt_to_send:
+                st.session_state.msgs.append({"role": "user", "content": prompt_to_send})
+                with st.chat_message("user"):
+                    st.markdown(prompt_to_send)
+
+                with st.chat_message("assistant"):
+                    with st.spinner("Analyzing with high-level reasoning model..."):
+                        try:
+                            client = genai.Client(api_key=api_key)
+                            response_text = ask_reasoning_chat(client, st.session_state.msgs, data)
+                            st.markdown(response_text)
+                            st.session_state.msgs.append({"role": "assistant", "content": response_text})
+                        except Exception as e:
+                            st.error(f"Error querying reasoning model: {e}")
+
+        with tab_data:
+            _saved = st.session_state.pop("tab3_msg", None)
+            if _saved:
+                getattr(st, _saved[0])(_saved[1])
+            col_flag_toggle, col_flag_info = st.columns([2, 3])
+            with col_flag_toggle:
+                # Under data, show only flagged samples is checked by default
+                show_only_flagged = st.checkbox("Show only flagged samples", value=True, key="chk_flagged_default")
+
+            df_to_show = data.copy()
+            if show_only_flagged:
+                df_to_show = df_to_show[df_to_show["IS_FLAGGED"] == True]
+
+            with col_flag_info:
+                flagged_count = int(data["IS_FLAGGED"].sum())
+                st.caption(f"Showing **{len(df_to_show)}** of **{len(data)}** samples (**{flagged_count}** flagged for review).")
+
+            if df_to_show.empty:
+                if show_only_flagged:
+                    st.success("🎉 No flagged samples found! All samples meet MRG Labs quality criteria.")
+                else:
+                    st.info("No records in this dataset.")
+            else:
+                view_cols = [c for c in GRID_COLS if c in df_to_show.columns]
+                grid_rows = []
+                for idx, r in df_to_show.iterrows():
+                    row_d = {"_i": int(idx)}
+                    for c in view_cols:
+                        v = r.get(c)
+                        row_d[c] = "" if _is_blank(v) else (str(int(v)) if c == "TURNAROUND_DAYS" else str(v))
+                    grid_rows.append(row_d)
+                shown = {int(i) for i in df_to_show.index}
+                grid_flags = {}
+                for (ri, col), items in cell_flags.items():
+                    if ri in shown and col in view_cols:
+                        tip = "; ".join(("Missing " + t) if k == "missing" else t for k, t in items)
+                        grid_flags.setdefault(str(ri), {})[col] = tip
+
+                grid_version = f"{raw_sig}-{edit_state['version']}"
+                grid_value = grid_editor(
+                    rows=grid_rows,
+                    columns=view_cols,
+                    editable=[c for c in DB_EDIT_COLS if c in view_cols],
+                    flags=grid_flags,
+                    version=grid_version,
+                    key="tab3_grid",
+                    default=None,
+                )
+
+                if (
+                    isinstance(grid_value, dict)
+                    and grid_value.get("action") == "save"
+                    and grid_value.get("version") == grid_version
+                    and grid_value.get("token") != edit_state.get("handled")
+                ):
+                    edit_state["handled"] = grid_value["token"]
+                    level, message = save_grid_changes(grid_value, raw_base, edit_state)
+                    if level == "error":
+                        st.error(message)
+                    else:
+                        edit_state["version"] += 1
+                        st.session_state["tab3_msg"] = (level, message)
+                        st.rerun()
+# ---------- Snowflake Intake (app2: feed, Cortex Analyst, flags, submit) ----------
+with tab4:
+    T = INTAKE_TEXT
+    st.subheader(T["title"])
+    st.caption(
+        "Live Snowflake review of batches synced from OCR → Tiger Data → STAGING_SAMPLES. "
+        "Ask Cortex Analyst about copied rows, missing fields, duplicates, and turnaround."
+    )
     try:
         session = get_snowflake_session()
     except Exception as e:
         st.error(f"Could not connect to Snowflake: {e}")
         st.info(
-            "Set SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, and place `rsa_key.p8` in the app directory "
+            "Set SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, and place rsa_key.p8 in the app directory "
             "(or set SNOWFLAKE_PRIVATE_KEY_PATH)."
         )
-        st.stop()
+        session = None
 
-    try:
-        # Manual CSV upload into Snowflake (same as original Sample Intake)
-        with st.expander("Upload weekly OCR output CSV"):
-            f = st.file_uploader("CSV", type="csv", label_visibility="collapsed", key="sf_csv_upload")
-            if f is not None and st.button("Load into Snowflake"):
-                up_df = pd.read_csv(f, dtype=str)
-                up_df.columns = [c.strip().upper().replace(" ", "_") for c in up_df.columns]
-                up_df = up_df.reindex(
-                    columns=CSV_COLS + (["TUBE_SIZE"] if "TUBE_SIZE" in up_df.columns else [])
-                )
-                if "TUBE_SIZE" not in up_df.columns:
-                    up_df["TUBE_SIZE"] = None
-                batch = f"BATCH_{pd.Timestamp.now():%Y%m%d_%H%M%S}"
-                up_df["BATCH_ID"] = batch
-                session.write_pandas(
-                    up_df,
-                    "STAGING_SAMPLES",
-                    database=SF_DATABASE,
-                    schema=SF_SCHEMA,
-                    auto_create_table=False,
-                    overwrite=False,
-                )
-                session.sql(
-                    f"UPDATE {DB_SCHEMA}.STAGING_SAMPLES SET STATUS = 'PENDING' WHERE STATUS IS NULL"
-                ).collect()
-                st.session_state.last_snowflake_batch = batch
-                st.success(f"Loaded {len(up_df)} rows into batch {batch}")
+    if session is not None:
+        def q(sql: str, params=None) -> pd.DataFrame:
+            return sf_query(session, sql, params=params)
 
-        batches = sf_query(
-            session, f"SELECT DISTINCT BATCH_ID FROM {DB_SCHEMA}.STAGING_SAMPLES ORDER BY 1 DESC"
-        )["BATCH_ID"].tolist()
-
-        if not batches:
-            st.info("No pending samples in Snowflake yet. Process labels on the Image Upload tab first.")
-        else:
-            default_idx = 0
-            if st.session_state.last_snowflake_batch in batches:
-                default_idx = batches.index(st.session_state.last_snowflake_batch)
-            batch = st.selectbox("Batch", batches, index=default_idx)
-
-            data = sf_query(
-                session,
-                f"SELECT * FROM {DB_SCHEMA}.MRG_VIEW WHERE BATCH_ID = ?",
-                [batch],
-            )
-            pending = data[data["STATUS"] == "PENDING"] if "STATUS" in data.columns else data
-            dup_rows = pending[pending["IS_DUPLICATE"]] if "IS_DUPLICATE" in pending.columns else pending.iloc[0:0]
-
-            c = st.columns(5)
-            c[0].metric("Samples", len(data))
-            c[1].metric("Duplicate IDs", int(data["IS_DUPLICATE"].sum()) if "IS_DUPLICATE" in data else 0)
-            c[2].metric("Missing fields", int(data["HAS_MISSING_FIELD"].sum()) if "HAS_MISSING_FIELD" in data else 0)
-            c[3].metric("Bad dates", int(data["HAS_BAD_DATE"].sum()) if "HAS_BAD_DATE" in data else 0)
-            turnaround = (
-                round(float(data["TURNAROUND_DAYS"].mean() or 0), 1)
-                if "TURNAROUND_DAYS" in data and len(data)
-                else 0
-            )
-            c[4].metric("Avg turnaround (days)", turnaround)
-
-            if len(dup_rows):
-                st.warning(
-                    f"{len(dup_rows)} rows share a Sample ID and are flagged — see the Flagged samples tab."
-                )
-
-            tab_dash, tab_chat, tab_fix, tab_data = st.tabs(
-                ["Dashboard", "Ask the data", "Flagged samples", "Data"]
-            )
-
-            with tab_dash:
-                a, b = st.columns(2)
-                if "DATE_RECEIVED" in data.columns:
-                    a.subheader("Samples received per day")
-                    a.bar_chart(data.groupby("DATE_RECEIVED").size().rename("samples"))
-                if "MACHINE" in data.columns:
-                    b.subheader("Samples per machine")
-                    b.bar_chart(data.groupby("MACHINE").size().rename("samples"))
-                if "COMPONENT" in data.columns:
-                    a.subheader("Samples per component")
-                    a.bar_chart(data.groupby("COMPONENT").size().rename("samples"))
-                if "TUBE_SIZE" in data.columns:
-                    b.subheader("Small vs Large tubes")
-                    b.bar_chart(data.groupby("TUBE_SIZE").size().rename("samples"))
-
-            with tab_chat:
-                st.caption(
-                    "Ask a question, e.g. 'Which machines have the longest turnaround?' "
-                    "or 'Which Sample IDs are missing fields?'"
-                )
-                for m in st.session_state.msgs:
-                    with st.chat_message(m["role"]):
-                        for part in m["content"]:
-                            if part["type"] == "text":
-                                st.markdown(part["text"])
-                            elif part["type"] == "sql":
-                                with st.expander("SQL"):
-                                    st.code(part["statement"], language="sql")
-                                res = sf_query(session, part["statement"])
-                                st.dataframe(res, use_container_width=True)
-                                num = res.select_dtypes("number").columns
-                                if len(res.columns) == 2 and len(num) == 1 and len(res) > 1:
-                                    st.bar_chart(res.set_index(res.columns[0]))
-
-                prompt = st.chat_input("Ask Cortex Analyst about this intake data…")
-                if prompt:
-                    st.session_state.msgs.append(
-                        {"role": "user", "content": [{"type": "text", "text": prompt}]}
+        try:
+            with st.expander(T["feed"], expanded=True):
+                try:
+                    cfg = q(f"SELECT MODE, SOURCE_URL, SIM_FILE FROM {DB_SCHEMA}.FEED_CONFIG").iloc[0]
+                    runs = q(f"SELECT * FROM {DB_SCHEMA}.FEED_RUN_LOG ORDER BY RUN_AT DESC LIMIT 10")
+                    state = q(f"SELECT LAST_ROW_NUMBER FROM {DB_SCHEMA}.FEED_STATE")
+                    src = (
+                        cfg["SOURCE_URL"] if cfg["MODE"] == "LIVE"
+                        else f"@SIM_SERVER/{cfg['SIM_FILE']} (stand-in for {cfg['SOURCE_URL']})"
                     )
-                    try:
-                        reply = ask_analyst(session, st.session_state.msgs)
-                        st.session_state.msgs.append(
-                            {"role": "analyst", "content": reply["content"]}
+                    k = st.columns(4)
+                    k[0].metric(T["feed_mode"], cfg["MODE"])
+                    k[1].metric(
+                        T["feed_last"],
+                        f"{runs.iloc[0]['RUN_AT']:%b %d %H:%M}" if len(runs) else T["feed_never"],
+                    )
+                    k[2].metric(T["feed_new"], int(runs.iloc[0]["ROWS_NEW"]) if len(runs) else 0)
+                    k[3].metric(T["feed_total"], int(state.iloc[0, 0]) if len(state) else 0)
+                    st.caption(f"{T['feed_source']}: {src}")
+                    if len(runs) and pd.notna(runs.iloc[0]["ERROR"]):
+                        st.error(T["feed_err"].format(e=runs.iloc[0]["ERROR"]))
+                    b1, b2, b3 = st.columns([2, 2, 1])
+                    if b1.button(T["feed_pull"], type="primary", use_container_width=True):
+                        with st.spinner(T["feed_pull"]):
+                            msg = session.sql(f"CALL {DB_SCHEMA}.PULL_FEED()").collect()[0][0]
+                        st.session_state.feed_msg = msg
+                        st.rerun()
+                    if cfg["MODE"] == "SIMULATED":
+                        n_add = b3.number_input(T["feed_sim_n"], 1, 500, 50, label_visibility="collapsed")
+                        if b2.button(T["feed_sim"], use_container_width=True):
+                            st.toast(
+                                session.sql(
+                                    f"CALL {DB_SCHEMA}.SIMULATE_SERVER_APPEND({int(n_add)})"
+                                ).collect()[0][0]
+                            )
+                    if "feed_msg" in st.session_state:
+                        m = st.session_state.pop("feed_msg")
+                        (st.error if str(m).startswith("ERROR") else st.success)(m)
+                    if len(runs):
+                        st.caption(T["feed_history"])
+                        st.dataframe(
+                            runs[["RUN_AT", "ROWS_READ", "ROWS_NEW", "METHOD", "BATCH_ID", "ERROR"]],
+                            hide_index=True, use_container_width=True,
                         )
-                    except Exception as e:
-                        st.session_state.msgs.pop()
-                        st.error(str(e))
-                    st.rerun()
+                except Exception as feed_err:
+                    st.warning(f"Server feed unavailable: {feed_err}")
 
-            flagged = pending.copy()
-            if len(flagged) and {"IS_DUPLICATE", "HAS_MISSING_FIELD", "HAS_BAD_DATE"}.issubset(flagged.columns):
-                flagged = flagged[
-                    flagged["IS_DUPLICATE"] | flagged["HAS_MISSING_FIELD"] | flagged["HAS_BAD_DATE"]
-                ].copy()
-                flagged["FLAG_REASON"] = [
-                    ", ".join(
-                        n for n, flag in [
-                            ("Duplicate ID", d),
-                            ("Missing field", m),
-                            ("Bad date", b),
-                        ] if flag
+            with st.expander(T["upload"]):
+                f = st.file_uploader("CSV", type="csv", label_visibility="collapsed", key="sf_live_csv")
+                if f is not None and st.button("Load", key="sf_live_load"):
+                    up_df = pd.read_csv(f, dtype=str)
+                    up_df.columns = [c.strip().upper().replace(" ", "_") for c in up_df.columns]
+                    tube_col = next((h for h in TUBE_HEADERS if h in up_df.columns), None)
+                    tube = up_df[tube_col] if tube_col else None
+                    up_df = up_df.reindex(columns=CSV_COLS)
+                    up_df["TUBE_SIZE"] = normalize_tube_series(tube)
+                    batch_id = f"BATCH_{pd.Timestamp.now():%Y%m%d_%H%M%S}"
+                    up_df["BATCH_ID"] = batch_id
+                    session.write_pandas(
+                        up_df, "STAGING_SAMPLES",
+                        database=SF_DATABASE, schema=SF_SCHEMA,
+                        auto_create_table=False, overwrite=False,
                     )
-                    for d, m, b in zip(
-                        flagged["IS_DUPLICATE"],
-                        flagged["HAS_MISSING_FIELD"],
-                        flagged["HAS_BAD_DATE"],
-                    )
-                ]
+                    session.sql(
+                        f"UPDATE {DB_SCHEMA}.STAGING_SAMPLES SET STATUS = 'PENDING' WHERE STATUS IS NULL"
+                    ).collect()
+                    st.session_state.last_snowflake_batch = batch_id
+                    st.success(T["loaded"].format(n=len(up_df), b=batch_id))
+
+            batches = q(
+                f"SELECT DISTINCT BATCH_ID FROM {DB_SCHEMA}.STAGING_SAMPLES ORDER BY 1 DESC"
+            )["BATCH_ID"].tolist()
+            if not batches:
+                st.info("No samples in Snowflake yet. Process labels on Image Upload first.")
             else:
-                flagged = flagged.iloc[0:0]
+                default_idx = 0
+                if st.session_state.last_snowflake_batch in batches:
+                    default_idx = batches.index(st.session_state.last_snowflake_batch)
+                batch = st.selectbox(
+                    T["batch"], batches + [ALL], index=default_idx,
+                    format_func=lambda b: T["all_batches"] if b == ALL else b,
+                )
+                if st.session_state.get("chat_batch") != batch:
+                    try:
+                        session.sql(
+                            f"""MERGE INTO {DB_SCHEMA}.CHAT_BATCH_SELECTION t
+                                USING (SELECT CURRENT_USER() AS U) s ON t.USER_NAME = s.U
+                                WHEN MATCHED THEN UPDATE SET BATCH_ID = ?, UPDATED_AT = CURRENT_TIMESTAMP()
+                                WHEN NOT MATCHED THEN INSERT VALUES (s.U, ?, CURRENT_TIMESTAMP())""",
+                            params=[batch, batch],
+                        ).collect()
+                    except Exception as sel_err:
+                        st.caption(f"Chat batch selection note: {sel_err}")
+                    st.session_state.chat_batch = batch
 
-            with tab_flag:
-                if len(flagged):
-                    unflagged_col = "UNFLAGGED" if "UNFLAGGED" in flagged.columns else None
-                    if unflagged_col:
-                        st.warning(
-                            f"{int((~flagged['UNFLAGGED']).sum())} samples are flagged. "
-                            "Labels can't be corrected — they will be submitted with their flag."
+                data = (
+                    q(f"SELECT * FROM {DB_SCHEMA}.MRG_VIEW") if batch == ALL
+                    else q(f"SELECT * FROM {DB_SCHEMA}.MRG_VIEW WHERE BATCH_ID = ?", [batch])
+                )
+                pending = data[data["STATUS"] == "PENDING"] if "STATUS" in data.columns else data
+                dup_rows = (
+                    pending[pending["IS_DUPLICATE"]] if "IS_DUPLICATE" in pending.columns
+                    else pending.iloc[0:0]
+                )
+
+                c = st.columns(5)
+                c[0].metric(T["samples"], len(data))
+                c[1].metric(T["dups"], int(data["IS_DUPLICATE"].sum()) if "IS_DUPLICATE" in data else 0)
+                c[2].metric(T["missing"], int(data["HAS_MISSING_FIELD"].sum()) if "HAS_MISSING_FIELD" in data else 0)
+                c[3].metric(T["bad_dates"], int(data["HAS_BAD_DATE"].sum()) if "HAS_BAD_DATE" in data else 0)
+                turnaround = (
+                    round(float(data["TURNAROUND_DAYS"].mean() or 0), 1)
+                    if "TURNAROUND_DAYS" in data and len(data) else 0
+                )
+                c[4].metric(T["turnaround"], turnaround)
+                if len(dup_rows):
+                    st.warning(T["dup_alert"].format(n=len(dup_rows)))
+
+                tab_dash, tab_chat, tab_fix, tab_data = st.tabs(
+                    [T["tab_dash"], T["tab_chat"], T["tab_fix"], T["tab_data"]]
+                )
+
+                with tab_dash:
+                    a, b = st.columns(2)
+                    if "DATE_RECEIVED" in data.columns:
+                        a.subheader(T["per_day"])
+                        a.bar_chart(data.groupby("DATE_RECEIVED").size().rename("samples"))
+                    machine_col = "NORM_MACHINE" if "NORM_MACHINE" in data.columns else "MACHINE"
+                    if machine_col in data.columns:
+                        b.subheader(T["per_machine"])
+                        b.bar_chart(data.groupby(machine_col).size().rename("samples"))
+                    if "COMPONENT" in data.columns:
+                        a.subheader(T["per_component"])
+                        a.bar_chart(data.groupby("COMPONENT").size().rename("samples"))
+                    if "TUBE_SIZE" in data.columns:
+                        b.subheader(T["per_tube"])
+                        b.bar_chart(data["TUBE_SIZE"].fillna(T["unknown"]).value_counts().rename("samples"))
+
+                def batch_context() -> str:
+                    if batch == ALL:
+                        return f"Context: the user is viewing ALL batches ({len(data)} samples in total)."
+                    return (
+                        f"Context: the user is viewing batch {batch} ({len(data)} samples). "
+                        "The data is already limited to this batch; count only these samples."
+                    )
+
+                with tab_chat:
+                    st.caption(batch_context().replace("Context: the user is", "Answering about"))
+                    for m in st.session_state.sf_msgs:
+                        with st.chat_message(m["role"]):
+                            if m.get("batch_label"):
+                                st.caption(m["batch_label"])
+                            for part in m["content"]:
+                                if part["type"] == "text":
+                                    st.markdown(part["text"])
+                                elif part["type"] == "sql":
+                                    with st.expander("SQL"):
+                                        st.code(part["statement"], language="sql")
+                                    res = part.get("result")
+                                    if res is None:
+                                        continue
+                                    st.dataframe(res, use_container_width=True)
+                                    num = res.select_dtypes("number").columns
+                                    if len(res.columns) == 2 and len(num) == 1 and len(res) > 1:
+                                        st.bar_chart(res.set_index(res.columns[0]))
+                    prompt = st.chat_input(T["chat_hint"])
+                    if prompt:
+                        st.session_state.sf_msgs.append(
+                            {"role": "user", "content": [{"type": "text", "text": prompt}]}
                         )
-                        st.caption("Tick 'Unflag' to clear a flag (untick to re-flag), then save.")
+                        api_msgs = [
+                            {
+                                "role": m["role"],
+                                "content": [{k: v for k, v in p.items() if k != "result"} for p in m["content"]],
+                            }
+                            for m in st.session_state.sf_msgs
+                        ]
+                        api_msgs[-1]["content"] = [
+                            {"type": "text", "text": f"{batch_context()}\n\nQuestion: {prompt}"}
+                        ]
+                        try:
+                            reply = ask_analyst(session, api_msgs)
+                            for part in reply["content"]:
+                                if part["type"] == "sql":
+                                    part["result"] = q(part["statement"])
+                            label = T["all_batches"] if batch == ALL else batch
+                            st.session_state.sf_msgs.append(
+                                {"role": "analyst", "content": reply["content"], "batch_label": label}
+                            )
+                        except Exception as e:
+                            st.session_state.sf_msgs.pop()
+                            st.error(str(e))
+                        st.rerun()
+
+                if "HAS_ANY_ISSUE" in pending.columns:
+                    flagged = pending[pending["HAS_ANY_ISSUE"]].copy()
+                elif {"IS_DUPLICATE", "HAS_MISSING_FIELD", "HAS_BAD_DATE"}.issubset(pending.columns):
+                    flagged = pending[
+                        pending["IS_DUPLICATE"] | pending["HAS_MISSING_FIELD"] | pending["HAS_BAD_DATE"]
+                    ].copy()
+                else:
+                    flagged = pending.iloc[0:0]
+
+                with tab_fix:
+                    if len(flagged) and "UNFLAGGED" in flagged.columns:
+                        st.warning(T["flag_note"].format(n=int((~flagged["UNFLAGGED"]).sum())))
+                        st.caption(T["unflag_hint"])
+                        show_cols = [c for c in (
+                            ["UNFLAGGED", "FLAG_REASON", "ROW_ID", "BATCH_ID"] + CSV_COLS + ["TUBE_SIZE"]
+                        ) if c in flagged.columns]
                         edited = st.data_editor(
-                            flagged[["UNFLAGGED", "FLAG_REASON", "ROW_ID"] + CSV_COLS + ["TUBE_SIZE"]],
-                            key="unflag_editor",
-                            hide_index=True,
-                            use_container_width=True,
+                            flagged[show_cols],
+                            key="unflag_editor", hide_index=True, use_container_width=True,
                             column_config={
-                                "UNFLAGGED": st.column_config.CheckboxColumn("Unflag"),
+                                "UNFLAGGED": st.column_config.CheckboxColumn(T["unflag_col"]),
                                 "ROW_ID": None,
                             },
-                            disabled=["FLAG_REASON"] + CSV_COLS + ["TUBE_SIZE"],
+                            disabled=[c for c in show_cols if c != "UNFLAGGED"],
                         )
                         changed = edited[edited["UNFLAGGED"] != flagged["UNFLAGGED"].values]
-                        if st.button("Save flag changes", disabled=changed.empty):
+                        if st.button(T["save"], disabled=changed.empty):
                             for row_id, val in zip(changed["ROW_ID"], changed["UNFLAGGED"]):
                                 session.sql(
-                                    f"UPDATE {DB_SCHEMA}.STAGING_SAMPLES "
-                                    f"SET UNFLAGGED = ? WHERE ROW_ID = ?",
+                                    f"UPDATE {DB_SCHEMA}.STAGING_SAMPLES SET UNFLAGGED = ? WHERE ROW_ID = ?",
                                     params=[bool(val), int(row_id)],
                                 ).collect()
-                            st.toast("Flag changes saved.")
+                            st.toast(T["saved"])
                             st.rerun()
-                    else:
+                    elif len(flagged):
                         st.dataframe(flagged, use_container_width=True, hide_index=True)
-                else:
-                    st.success("No flagged samples — ready to submit.")
+                    else:
+                        st.success(T["no_issues"])
 
-            with tab_data:
-                st.dataframe(data, use_container_width=True, hide_index=True)
+                with tab_data:
+                    st.dataframe(data, use_container_width=True, hide_index=True)
 
-            st.divider()
-            nothing = len(pending) == 0
-            flagged_count = (
-                int(pending["IS_FLAGGED"].sum())
-                if "IS_FLAGGED" in pending.columns and len(pending)
-                else 0
-            )
-
-            def submit(action: str):
-                user = session.sql("SELECT CURRENT_USER()").collect()[0][0]
-                n = len(pending)
-                session.sql(
-                    f"""
-                    INSERT INTO {DB_SCHEMA}.MRG_SAMPLES
-                    SELECT SAMPLE_ID, DATE_SAMPLED, DATE_RECEIVED, MACHINE, COMPONENT, SERIAL_NUMBER, REFERENCE_LUBE,
-                           TUBE_SIZE, BATCH_ID, CURRENT_TIMESTAMP(), ?,
-                           IS_FLAGGED,
-                           NULLIF(ARRAY_TO_STRING(ARRAY_CONSTRUCT_COMPACT(
-                               IFF(IS_DUPLICATE, 'Duplicate ID', NULL),
-                               IFF(HAS_MISSING_FIELD, 'Missing field', NULL),
-                               IFF(HAS_BAD_DATE, 'Bad date', NULL),
-                               IFF(UNFLAGGED AND (IS_DUPLICATE OR HAS_MISSING_FIELD OR HAS_BAD_DATE), '(unflagged by user)', NULL)), ', '), '')
-                    FROM {DB_SCHEMA}.MRG_VIEW WHERE BATCH_ID = ? AND STATUS = 'PENDING'
-                    """,
-                    params=[user, batch],
-                ).collect()
-                session.sql(
-                    f"UPDATE {DB_SCHEMA}.STAGING_SAMPLES SET STATUS = 'SUBMITTED' "
-                    f"WHERE BATCH_ID = ? AND STATUS = 'PENDING'",
-                    params=[batch],
-                ).collect()
-                session.sql(
-                    f"INSERT INTO {DB_SCHEMA}.SUBMISSION_LOG VALUES (?, CURRENT_TIMESTAMP(), ?, ?, ?)",
-                    params=[batch, user, n, action],
-                ).collect()
-                st.session_state.popup = (
-                    f"Your data has been submitted to MRG: {n} samples "
-                    f"({flagged_count} flagged for review)."
+                st.divider()
+                nothing = len(pending) == 0
+                flagged_count = (
+                    int(pending["IS_FLAGGED"].sum())
+                    if "IS_FLAGGED" in pending.columns and len(pending) else 0
                 )
 
-            @st.dialog("Submitted to MRG")
-            def submitted_popup(msg: str):
-                st.success(msg)
-                if st.button("OK"):
+                def submit(action: str):
+                    user = session.sql("SELECT CURRENT_USER()").collect()[0][0]
+                    n = len(pending)
+                    session.sql(
+                        f"""
+                        INSERT INTO {DB_SCHEMA}.MRG_SAMPLES
+                        SELECT SAMPLE_ID, DATE_SAMPLED, DATE_RECEIVED, MACHINE, COMPONENT,
+                               SERIAL_NUMBER, REFERENCE_LUBE, TUBE_SIZE, BATCH_ID,
+                               CURRENT_TIMESTAMP(), ?,
+                               IS_FLAGGED,
+                               NULLIF(TRIM(COALESCE(FLAG_REASON, '') ||
+                                   IFF(UNFLAGGED AND HAS_ANY_ISSUE, ' (unflagged by user)', '')), '')
+                        FROM {DB_SCHEMA}.MRG_VIEW
+                        WHERE BATCH_ID = ? AND STATUS = 'PENDING'
+                        """,
+                        params=[user, batch],
+                    ).collect()
+                    session.sql(
+                        f"UPDATE {DB_SCHEMA}.STAGING_SAMPLES SET STATUS = 'SUBMITTED' "
+                        f"WHERE BATCH_ID = ? AND STATUS = 'PENDING'",
+                        params=[batch],
+                    ).collect()
+                    session.sql(
+                        f"INSERT INTO {DB_SCHEMA}.SUBMISSION_LOG VALUES (?, CURRENT_TIMESTAMP(), ?, ?, ?)",
+                        params=[batch, user, n, action],
+                    ).collect()
+                    st.session_state.popup = T["submitted"].format(n=n, f=int(flagged_count))
+
+                @st.dialog(T["popup_title"])
+                def submitted_popup(msg: str):
+                    st.success(msg)
+                    if st.button("OK", key="sf_submit_ok"):
+                        st.rerun()
+
+                if st.button(
+                    T["submit"], type="primary",
+                    disabled=nothing or batch == ALL, use_container_width=True,
+                ):
+                    submit("SUBMIT")
                     st.rerun()
-
-            if st.button("Submit to MRG", type="primary", disabled=nothing, use_container_width=True):
-                submit("SUBMIT")
-                st.rerun()
-            if nothing:
-                st.caption("No pending samples in this batch.")
-            if "popup" in st.session_state:
-                submitted_popup(st.session_state.pop("popup"))
-
-    except Exception as e:
-        st.error(f"Snowflake Intake error: {e}")
-    finally:
-        try:
-            session.close()
-        except Exception:
-            pass
+                if batch == ALL:
+                    st.caption(T["submit_pick"])
+                elif nothing:
+                    st.caption(T["nothing"])
+                if "popup" in st.session_state:
+                    submitted_popup(st.session_state.pop("popup"))
+        except Exception as e:
+            st.error(f"Snowflake Intake error: {e}")
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass

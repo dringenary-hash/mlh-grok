@@ -1,44 +1,26 @@
 # MRG Labs — Sample Label Scanner (YCP Hacks)
 
-Streamlit app for the Schneider Prize for Technology Innovation flow:
+1. **OCR** label images with Gemini (Large vs Small tube)
+2. **Anchor** each sample on Solana devnet
+3. **Write** rows to **Tiger Data**
+4. **Sync** the batch to Snowflake `MRG_LABS_DB.INTAKE.STAGING_SAMPLES`
+5. **Auto-run Grok QC** (SpaceXSI) — see [GROK_AUTOMATION.md](GROK_AUTOMATION.md)
+6. **Grease Intelligence** tab — local dashboard, grid edits, Gemini reasoning
+7. **Snowflake Intake** tab — Sample Intake app (server feed, Cortex Analyst, flags, submit to MRG)
 
-1. **OCR** label images with Gemini  
-2. **Write CSV/rows to Tiger Data**  
-3. **Sync the same batch to Snowflake** (`MRG_LABS_DB.INTAKE.STAGING_SAMPLES`)  
-4. **Auto-run Grok QC** on the batch (SpaceXSI automation)  
-5. **Review + chat** with Snowflake Cortex Analyst on the **Snowflake Intake** tab  
-
-## Tabs
-
-- **Image Upload** — Gemini OCR, Tiger Data write, Snowflake sync, **Grok auto-QC**, CSV download  
-- **Data Viewer** — live Tiger Data table + optional re-sync to Snowflake  
-- **Snowflake Intake** — Sample Intake dashboard, flagged samples, Cortex Analyst chatbot, submit to MRG  
-
-## Grok / SpaceXSI
-
-See **[GROK_AUTOMATION.md](GROK_AUTOMATION.md)** for how we use Cursor + Grok automation, what `XAI_API_KEY` is for, and submission talking points. Run history lands in `grok_qc_log.md`.
-
-## Required environment
+## Env
 
 | Variable | Purpose |
 |---|---|
-| `GEMINI_API_KEY` | Gemini OCR |
-| `TIGERDATA_URI` | Tiger Data (Postgres) SQLAlchemy URI |
-| `XAI_API_KEY` | Grok auto-QC (`GROK_API_KEY` also accepted) |
-| `GROK_MODEL` | optional, default `grok-3-mini` |
-| `SNOWFLAKE_ACCOUNT` | Snowflake account |
-| `SNOWFLAKE_USER` | Snowflake user |
-| `SNOWFLAKE_PRIVATE_KEY_PATH` | Path to `rsa_key.p8` (default: `rsa_key.p8`) |
-| `SNOWFLAKE_DATABASE` | Default `MRG_LABS_DB` |
-| `SNOWFLAKE_SCHEMA` | Default `INTAKE` |
-| `SNOWFLAKE_WAREHOUSE` | Default `COMPUTE_WH` |
-| `SNOWFLAKE_ROLE` | Default `ACCOUNTADMIN` |
-
-Snowflake objects expected (from the Sample Intake demo): `STAGING_SAMPLES`, `MRG_VIEW`, `MRG_SAMPLES`, `SUBMISSION_LOG`, semantic view `MRG_INTAKE_SV`.
-
-## Run
+| `GEMINI_API_KEY` | OCR + grease reasoning |
+| `TIGERDATA_URI` | Tiger Data |
+| `XAI_API_KEY` | Grok auto-QC (`.env`, gitignored) |
+| `SNOWFLAKE_ACCOUNT` / `SNOWFLAKE_USER` | Key-pair login |
+| `rsa_key.p8` | Snowflake private key |
+| `SOLANA_SECRET_KEY` | Devnet memo anchor |
 
 ```bash
-export XAI_API_KEY="your_xai_key"
 streamlit run app.py
 ```
+
+`MRG_Laboratories_Sample_Intake.py` is the standalone Sample Intake reference.
