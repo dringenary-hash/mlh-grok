@@ -16,6 +16,13 @@ import snowflake.snowpark as snowpark
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 
+# Load local secrets from .env if present (file is gitignored)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # _snowflake only exists in the warehouse runtime; local/container uses REST instead.
 try:
     import _snowflake
